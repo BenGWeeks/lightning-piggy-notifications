@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NostrEvent } from 'nostr-tools/pure';
-import { relayLabel, setPublicRelays } from '../src/relay.js';
+import { reasonCode, relayLabel, setPublicRelays } from '../src/relay.js';
 import { isPrivateAddress, normalizeRelayUrl } from '../src/relayUrl.js';
 import { RouteIndex, SeenCache } from '../src/router.js';
 import type { RegistrationSummary } from '../src/store.js';
@@ -94,6 +94,17 @@ describe('relay URL validation', () => {
       expect(normalizeRelayUrl(bad)).toBeNull();
     }
     expect(normalizeRelayUrl('ws://127.0.0.1:7777', true)).toBe('ws://127.0.0.1:7777');
+  });
+
+  it('extracts only the machine-readable reason code', () => {
+    expect(reasonCode('auth-required: please authenticate')).toBe('auth-required');
+    expect(reasonCode('ERROR: auth-required: requested filter requires authentication')).toBe('auth-required');
+    expect(reasonCode('banned: too many rate-limit violations, try again later')).toBe('banned');
+    expect(reasonCode('npub1abc… is not allowed')).toBe('other');
+    expect(reasonCode('alice-smith: account rejected')).toBe('other'); // identifier-like prefix
+    expect(reasonCode('ERROR: alice-smith: account rejected')).toBe('other');
+    expect(reasonCode('rate-limited: slow down')).toBe('rate-limited');
+    expect(reasonCode(undefined)).toBe('other');
   });
 
   it('logs configured relays by host and user relays opaquely', () => {

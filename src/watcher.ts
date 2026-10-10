@@ -13,7 +13,7 @@ import { ApnsSender } from './push/apns.js';
 import { FcmSender } from './push/fcm.js';
 import type { PushSender } from './push/types.js';
 import { MAX_WRAP_CONTENT, parseRegistration, RegistrationError, unwrapRegistration } from './registration.js';
-import { RelayPool, relayLabel, setPublicRelays, type RelayEventMeta } from './relay.js';
+import { reasonCode, RelayPool, relayLabel, setPublicRelays, type RelayEventMeta } from './relay.js';
 import { RouteIndex, SeenCache } from './router.js';
 import { Store } from './store.js';
 
@@ -189,7 +189,7 @@ export class Watcher {
       }
       ev ??= finalizeEvent(tpl, this.cfg.secretKey);
       const r = await conn.publish(ev);
-      log.info('kind 10050 published', { relay: relayLabel(url), ok: r.ok });
+      log.info('kind 10050 published', { relay: relayLabel(url), ok: r.ok, reason: r.ok ? undefined : reasonCode(r.msg) });
     }
   }
 

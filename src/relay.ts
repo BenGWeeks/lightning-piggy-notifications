@@ -48,11 +48,32 @@ export function relayLabel(url: string): string {
 }
 
 
-/** Log-safe CLOSED/NOTICE reason: the machine-readable prefix only (NIP-01 `code:`). */
+/**
+ * Log-safe CLOSED/OK reason: the NIP-01 machine-readable prefix only
+ * (`auth-required: …`). Some relays wrap it, e.g. damus sends
+ * `ERROR: auth-required: …`, so a leading `error:` is skipped.
+ */
 export function reasonCode(reason: unknown): string {
-  const m = /^([a-z][a-z-]{0,31}):/.exec(String(reason ?? ''));
-  return m ? m[1]! : 'other';
+  const text = String(reason ?? '').replace(/^\s*error:\s*/i, '');
+  const m = /^([a-z][a-z-]{0,31}):/.exec(text);
+  // Allowlist: an arbitrary prefix could be an identifier (e.g. "alice-smith: …").
+  return m && KNOWN_REASON_CODES.has(m[1]!) ? m[1]! : 'other';
 }
+
+/** NIP-01 / NIP-42 machine-readable prefixes, plus `banned` (common in practice). */
+const KNOWN_REASON_CODES = new Set([
+  'auth-required',
+  'restricted',
+  'blocked',
+  'rate-limited',
+  'invalid',
+  'pow',
+  'duplicate',
+  'error',
+  'mute',
+  'unsupported',
+  'banned',
+]);
 
 export interface RelayEventMeta {
   relay: string;
@@ -284,13 +305,14 @@ export class RelayConn {
         log.info('relay closed subscription', { relay: relayLabel(this.url), mode: sub.tpl.mode, reason: code });
         const n = (this.closedRetries.get(id) ?? 0) + 1;
         this.closedRetries.set(id, n);
-        if (code === 'auth-required') {
-          // If AUTH already succeeded (the OK can race ahead of this CLOSED),
-          // retry shortly; otherwise the AUTH handler re-opens it.
-          if (this.authed && n <= 3) this.scheduleReq(id, 2_000);
+        if (code === 'auth-required' && this.authed && n <= 3) {
+          // AUTH already succeeded (its OK can race ahead of this CLOSED): retry shortly.
+          this.scheduleReq(id, 2_000);
           return;
         }
-        // Rate limits, restarts, "too many subscriptions"…: back off per subscription.
+        // Otherwise back off per subscription. For auth-required this is the
+        // fallback if AUTH never succeeds; a successful AUTH re-opens it at once.
+        // (Also covers rate limits, restarts, "too many subscriptions"…)
         this.scheduleReq(id, Math.min(CLOSED_RETRY_MAX_MS, CLOSED_RETRY_MIN_MS * 2 ** Math.min(n - 1, 5)));
         return;
       }
@@ -321,6 +343,7 @@ export class RelayConn {
           content: '',
         });
         void this.publish(ev, 'AUTH').then((r) => {
+          log.info('relay auth', { relay: relayLabel(this.url), ok: r.ok, reason: r.ok ? undefined : reasonCode(r.msg) });
           if (!r.ok) return;
           this.authed = true;
           // Re-open anything the relay closed while unauthenticated (AUTH
