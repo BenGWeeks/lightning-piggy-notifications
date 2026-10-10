@@ -101,6 +101,9 @@ describe('relay URL validation', () => {
     expect(reasonCode('ERROR: auth-required: requested filter requires authentication')).toBe('auth-required');
     expect(reasonCode('banned: too many rate-limit violations, try again later')).toBe('banned');
     expect(reasonCode('npub1abc… is not allowed')).toBe('other');
+    expect(reasonCode('alice-smith: account rejected')).toBe('other'); // identifier-like prefix
+    expect(reasonCode('ERROR: alice-smith: account rejected')).toBe('other');
+    expect(reasonCode('rate-limited: slow down')).toBe('rate-limited');
     expect(reasonCode(undefined)).toBe('other');
   });
 

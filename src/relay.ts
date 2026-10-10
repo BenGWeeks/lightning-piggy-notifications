@@ -56,8 +56,24 @@ export function relayLabel(url: string): string {
 export function reasonCode(reason: unknown): string {
   const text = String(reason ?? '').replace(/^\s*error:\s*/i, '');
   const m = /^([a-z][a-z-]{0,31}):/.exec(text);
-  return m ? m[1]! : 'other';
+  // Allowlist: an arbitrary prefix could be an identifier (e.g. "alice-smith: …").
+  return m && KNOWN_REASON_CODES.has(m[1]!) ? m[1]! : 'other';
 }
+
+/** NIP-01 / NIP-42 machine-readable prefixes, plus `banned` (common in practice). */
+const KNOWN_REASON_CODES = new Set([
+  'auth-required',
+  'restricted',
+  'blocked',
+  'rate-limited',
+  'invalid',
+  'pow',
+  'duplicate',
+  'error',
+  'mute',
+  'unsupported',
+  'banned',
+]);
 
 export interface RelayEventMeta {
   relay: string;
