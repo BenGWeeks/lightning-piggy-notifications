@@ -50,15 +50,23 @@ describe('buildPlan', () => {
     expect(live.sinceAgoSec).toBeGreaterThan(0);
   });
 
-  it('chunks #p values and groups users by kind set', () => {
+  it('chunks #p values; every user gets the same superset filters whatever they enabled', () => {
     const regs = Array.from({ length: 1100 }, (_, i) => reg(i + 1));
     regs.push(reg(5000, { categories: { dm: false, zap: true, mention: false, payment: false } }));
+    regs.push(reg(5001, { categories: { dm: false, zap: false, mention: false, payment: true } }));
     const plan = buildPlan(regs, { watcherPubkey: WATCHER, defaultRelays: DEFAULTS, limits: DEFAULT_LIMITS });
-    const live = flat(plan.get(DEFAULTS[0]!)!).filter((s) => s.mode === 'live');
-    for (const s of live) expect(s.filter['#p']!.length).toBeLessThanOrEqual(DEFAULT_LIMITS.pTagChunk);
-    expect(live.filter((s) => s.filter.kinds!.join() === '1,4,9735')).toHaveLength(3);
-    expect(live.find((s) => s.filter.kinds!.join() === '9735')!.filter['#p']).toEqual([pk(5000)]);
-    expect(flat(plan.get(DEFAULTS[0]!)!).filter((s) => s.mode === 'wrap')).toHaveLength(3);
+    const all = flat(plan.get(DEFAULTS[0]!)!);
+    const live = all.filter((s) => s.mode === 'live');
+    const wrap = all.filter((s) => s.mode === 'wrap');
+    for (const s of [...live, ...wrap]) expect(s.filter['#p']!.length).toBeLessThanOrEqual(DEFAULT_LIMITS.pTagChunk);
+    // One kind set for everyone: relays can't tell which categories a user toggled.
+    expect(new Set(live.map((s) => s.filter.kinds!.join()))).toEqual(new Set(['1,4,9735']));
+    expect(live).toHaveLength(3);
+    expect(wrap).toHaveLength(3);
+    for (const user of [pk(5000), pk(5001)]) {
+      expect(live.some((s) => s.filter['#p']!.includes(user))).toBe(true);
+      expect(wrap.some((s) => s.filter['#p']!.includes(user))).toBe(true);
+    }
     // Chunks are packed into few REQs, each within the filter-count and byte budgets.
     const subs = plan.get(DEFAULTS[0]!)!;
     expect(subs.length).toBeLessThan(flat(subs).length);
@@ -68,17 +76,34 @@ describe('buildPlan', () => {
     }
   });
 
-  it('watches NWC client pubkeys only for users with payments on', () => {
+  it('users with every category off are not watched', () => {
+    const plan = buildPlan([reg(1, { categories: { dm: false, zap: false, mention: false, payment: false } })], {
+      watcherPubkey: WATCHER,
+      defaultRelays: DEFAULTS,
+      limits: DEFAULT_LIMITS,
+    });
+    expect(flat(plan.get(DEFAULTS[0]!)!).filter((s) => s.mode !== 'inbox')).toEqual([]);
+  });
+
+  it('sends NWC client keys only to relays the user listed, whatever the payment toggle', () => {
     const nwc = 'c'.repeat(64);
+    const walletRelay = 'wss://wallet.example';
     const plan = buildPlan(
       [
-        reg(1, { categories: { dm: false, zap: false, mention: false, payment: true }, nwc: [{ client: nwc, wallet: 'e'.repeat(64) }] }),
-        reg(2, { nwc: [{ client: 'd'.repeat(64), wallet: 'e'.repeat(64) }] }),
+        reg(1, { categories: { dm: false, zap: false, mention: false, payment: true }, relays: [walletRelay], nwc: [{ client: nwc, wallet: 'e'.repeat(64) }] }),
+        reg(2, { relays: [walletRelay], nwc: [{ client: 'd'.repeat(64), wallet: 'e'.repeat(64) }] }),
+        reg(3, { relays: [DEFAULTS[1]!], nwc: [{ client: 'b'.repeat(64), wallet: 'e'.repeat(64) }], categories: { dm: true, zap: true, mention: true, payment: true } }),
       ],
       { watcherPubkey: WATCHER, defaultRelays: DEFAULTS, limits: DEFAULT_LIMITS },
     );
-    const nwcSub = flat(plan.get(DEFAULTS[0]!)!).find((s) => s.filter.kinds!.includes(23196))!;
-    expect(nwcSub.filter).toEqual({ kinds: [23196, 23197], '#p': [nwc] });
+    const nwcFilters = (url: string) => flat(plan.get(url)!).filter((s) => s.filter.kinds!.includes(23196));
+    // Not on a default relay the user didn't list...
+    expect(nwcFilters(DEFAULTS[0]!)).toEqual([]);
+    // ...but on the one they did, and on their own (wallet) relay.
+    expect(nwcFilters(DEFAULTS[1]!).map((s) => s.filter)).toEqual([{ kinds: [23196, 23197], '#p': ['b'.repeat(64)] }]);
+    // User 2 has payment pushes off but still lists the connection: the filter
+    // doesn't reveal the toggle (the router drops their payment events).
+    expect(nwcFilters(walletRelay).map((s) => s.filter)).toEqual([{ kinds: [23196, 23197], '#p': [nwc, 'd'.repeat(64)] }]);
   });
 
   it('subscription ids are stable for unchanged filters', () => {

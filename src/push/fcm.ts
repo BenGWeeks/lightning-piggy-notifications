@@ -1,9 +1,19 @@
 // FCM HTTP v1 with OAuth2 service-account auth (JWT bearer grant).
 
 import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
-import { errCode, log } from '../log.js';
+import { errCode, warnThrottled } from '../log.js';
 import type { Device } from '../store.js';
-import { ALERT_TITLE, alertBody, pushData, type PushNotification, type PushResult, type PushSender } from './types.js';
+import {
+  ALERT_TITLE,
+  alertBody,
+  pushData,
+  VALIDATION_DATA,
+  type PushNotification,
+  type PushResult,
+  type PushSender,
+  type TokenCheck,
+  type TokenTarget,
+} from './types.js';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
@@ -70,7 +80,7 @@ export class FcmSender implements PushSender {
     return this.access.token;
   }
 
-  buildMessage(device: Device, n: PushNotification): Record<string, unknown> {
+  buildMessage(device: TokenTarget, n: PushNotification): Record<string, unknown> {
     return {
       message: {
         token: device.token,
@@ -99,7 +109,7 @@ export class FcmSender implements PushSender {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
-      log.warn('fcm transport error', { err: errCode(e) });
+      warnThrottled(`fcm transport ${errCode(e)}`, 'fcm transport error', { err: errCode(e) });
       return { retry: true };
     }
     // Always consume the body so the connection is released promptly.
@@ -115,8 +125,40 @@ export class FcmSender implements PushSender {
     // Quota: the notifier backs off from 60 s (FCM guidance) and never earlier than Retry-After.
     if (res.status === 429 || code === 'QUOTA_EXCEEDED') return { retry: true, quota: true, afterMs: after };
     if (res.status >= 500 || code === 'UNAVAILABLE' || code === 'INTERNAL') return { retry: true, afterMs: after };
-    log.warn('fcm rejected push', { status: res.status, code: code.slice(0, 40), app: device.app });
+    warnThrottled(`fcm push ${res.status} ${code.slice(0, 40)} ${device.app}`, 'fcm rejected push', { status: res.status, code: code.slice(0, 40), app: device.app });
     return 'error';
+  }
+
+  /**
+   * Admission check: `validate_only` makes FCM check the message (including
+   * the token) without delivering anything to the device.
+   */
+  async validate(t: TokenTarget, retried = false): Promise<TokenCheck> {
+    let res: FetchResponse;
+    try {
+      const token = await this.accessToken();
+      res = await this.fetchFn(`https://fcm.googleapis.com/v1/projects/${this.opts.projectId}/messages:send`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ validate_only: true, message: { token: t.token, data: { ...VALIDATION_DATA } } }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (e) {
+      warnThrottled(`fcm transport ${errCode(e)}`, 'fcm transport error', { err: errCode(e) });
+      return 'unavailable';
+    }
+    const body = await res.text().catch(() => '');
+    if (res.status === 200) return 'ok';
+    const { code, message } = parseFcmError(body);
+    if (res.status === 401 && !retried) {
+      this.access = null;
+      return this.validate(t, true);
+    }
+    if (isInvalidToken(res.status, code, message)) return 'invalid';
+    if (res.status !== 429 && res.status < 500) {
+      warnThrottled(`fcm check ${res.status} ${code.slice(0, 40)} ${t.app}`, 'fcm rejected token check', { status: res.status, code: code.slice(0, 40), app: t.app });
+    }
+    return 'unavailable';
   }
 }
 

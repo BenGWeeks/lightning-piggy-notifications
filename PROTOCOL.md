@@ -58,7 +58,7 @@ someone else.
 | `app` | The app id. It is also the APNs topic, so it must be the iOS bundle id / Android package. The watcher only accepts ids it is configured for. |
 | `apns_env` | Optional, iOS only: `production` (the default) or `sandbox`. This is the APNs environment the token was issued for. It follows the build's signing (`aps-environment` entitlement), not its bundle id. The iOS Simulator and development-signed (Xcode / `expo run:ios`) builds get `sandbox`. App Store, TestFlight and ad hoc builds get `production`, and that includes EAS `distribution: internal` builds of the dev client. Read it with `expo-application`'s `getIosPushNotificationServiceEnvironmentAsync()`, where `'development'` means `sandbox`. If the field is omitted, the operator's `WATCHER_APNS_SANDBOX_APPS` fallback applies (empty by default). |
 | `categories` | Missing keys mean `false`. `dm` covers NIP-04 (kind 4) and NIP-17 (kind 1059). `zap` covers kind 9735. `mention` covers kind 1 with a `p` tag. `payment` covers NWC notifications (kinds 23196/23197). |
-| `relays` | `wss://` only. Hostnames only: no IP literals, `localhost`, `.local` or similar. No credentials or query string. URLs are normalised and de-duplicated, and anything invalid is dropped. At most 8 are kept (sending more than 16 is rejected). Include the user's DM inbox relays (kind 10050), their read relays (kind 10002), **and the NWC wallet relay** if `payment` is on. The watcher always watches its own default relays as well. |
+| `relays` | `wss://` only. Hostnames only: no IP literals, `localhost`, `.local` or similar. No credentials or query string. URLs are normalised and de-duplicated, and anything invalid is dropped. At most 8 are kept (sending more than 16 is rejected). Include the user's DM inbox relays (kind 10050), their read relays (kind 10002), **and the NWC wallet relay** if `payment` is on. The watcher always watches its own default relays for DMs, zaps and mentions as well, but sends NWC filters **only** to relays listed here (so the client keys aren't exposed to every default relay): without the wallet relay, payment pushes won't fire. NWC filters are sent whenever `nwc` is non-empty, whatever `categories.payment` says (so relays can't see that toggle); to stop watching a connection at all, omit it from `nwc`. |
 | `nwc` | 0–3 entries, one per NWC connection. `client` is the pubkey of the connection's `secret` (the `p` tag on the wallet's notifications). `wallet` is the wallet service pubkey (the `nostr+walletconnect://<wallet>` part, and the author of the notifications). `proof` (128 hex chars) is a BIP-340 Schnorr signature **by the client secret** over `sha256("lightning-piggy-watcher/nwc/v1:" + <user pubkey hex> + ":" + <wallet pubkey hex>)`. The proof means only someone holding the connection secret can claim its notifications. It is bound to the user, so it can't be reused by anyone else. A payment push only fires when a kind 23196/23197 event `p`-tags `client` **and** is authored by `wallet`. |
 | `ts` | Must equal the rumor's `created_at`. It must be no more than 6 hours in the past and no more than 2 minutes in the future. It must also **strictly increase** for each (user, token). |
 
@@ -84,8 +84,12 @@ someone else.
   users with **no** state on this watcher (brand-new users), whose first
   registration can be delayed for as long as the flood lasts. Existing users
   are never affected.
-- Requests refused for capacity are settled into the user's watermark too, so
-  their replays are stale.
+- Requests refused for capacity or for an invalid token are settled into the
+  user's watermark too, so their replays are stale (and can't trigger another
+  token check).
+- A watermark of a user with no live registration is kept only as long as the
+  6-hour timestamp window: after that, every request it could block is refused
+  as too old anyway.
 - Stale and replayed requests are rejected before they count against the user's
   hourly allowance.
 - Tokens are scoped to (platform, app, token). A rejection for one app id
@@ -99,11 +103,25 @@ someone else.
 Per user: 30 registration events per hour and 10 devices. When an 11th device
 registers, the least recently refreshed one is dropped. If the new device's
 `ts` isn't newer than the one it would replace, the new device is refused instead. Registrations that are
-not refreshed for **60 days** expire.
+not refreshed for **30 days** expire.
 
 Per watcher: by default 1,000 registrations. That is the most its default relays
-can provably carry within 15 subscriptions of at most 60 KB each. Beyond the
-cap, new devices get no push, and `/ready` reports any planning overflow.
+can provably carry within 15 subscriptions of at most 60 KB each. Admission into
+that cap (details in the README, "Capacity and admission"):
+
+- A **new device's token is checked** with APNs/FCM before it is admitted,
+  without showing anything (FCM `validate_only`; an APNs background push with
+  `content-available` and no alert). A token the provider rejects is refused.
+  If the check can't be made, the device is admitted provisionally, until its
+  first accepted push.
+- At most 60 **new devices** are admitted per hour across all keys by default
+  (refreshes don't count), and one device token can be registered by at most
+  5 keys (several accounts on one phone). Past that, the least recently
+  refreshed of them is replaced.
+- When full, a newcomer with a validated token replaces the least recently
+  refreshed provisional registration; validated registrations are never
+  replaced. Otherwise the newcomer is refused, and the app retries on its next
+  refresh.
 
 ### No acknowledgement
 
@@ -131,10 +149,20 @@ All pushes use generic text only. The title is `Lightning Piggy`.
 | `mention` | New mention | N new mentions | Notifications |
 | `payment` | Payment received | N payments received | Home (wallet) |
 
-Data (FCM `data`, APNs top-level keys): `{ "source": "lp-watcher", "category": "<category>", "kind": "<nostr kind>" }`.
+Data (FCM `data`, APNs top-level keys): `{ "source": "lp-watcher", "category": "<category>" }`.
+The category is all the app needs to route a tap; the Nostr kind isn't sent.
 APNs uses `thread-id` and `apns-collapse-id` = `lp-<category>`. FCM uses `collapse_key` and
 `android.notification.tag` = `lp-<category>`, and posts to the Android channel `messages` (dm, mention) or `payments` (zap, payment). A newer push for the same category
 therefore replaces the older one on the device.
+
+Apple and Google see the category (in the data, the collapse id / thread id and
+the Android tag and channel) and the coalesced count (in the alert text), as
+well as the app id, the device token and the time.
+
+The only other push is the **token check** when a device first registers. On
+FCM it is `validate_only` and never reaches the device. On iOS it is a silent
+background push, `{ "aps": { "content-available": 1 }, "source": "lp-watcher", "type": "validate" }`,
+which the app should ignore.
 
 `payment` is triggered by any NWC notification from the registered wallet,
 including `payment_sent`, because the watcher can't decrypt them. A payment the
@@ -234,6 +262,8 @@ export async function buildRegistrationWrap(signer: Signer, reg: Registration, l
   pushes when the app opens.
 - **Foreground.** Suppress the system alert for `source: lp-watcher` pushes
   while the app is open, because live data already shows the event.
+- **Token check.** Ignore the silent `type: validate` background push (iOS)
+  sent when a device first registers.
 - **Auth-gated inbox relays** (NIP-42 relays that only serve kind 1059 to the
   recipient) won't deliver the user's gift wraps to the watcher, because it can't
   authenticate as the user. List public inbox relays if DM pushes matter.

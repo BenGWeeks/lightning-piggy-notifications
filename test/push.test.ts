@@ -34,7 +34,7 @@ describe('ApnsSender', () => {
         return { status: 200, body: '' };
       },
     );
-    expect(await sender.send(device(), { category: 'zap', count: 1, eventKind: 9735 })).toBe('ok');
+    expect(await sender.send(device(), { category: 'zap', count: 1 })).toBe('ok');
     const [origin, path, headers, body] = calls[0]!;
     expect(origin).toBe(APNS_PRODUCTION);
     expect(path).toBe(`/3/device/${'a'.repeat(64)}`);
@@ -52,7 +52,7 @@ describe('ApnsSender', () => {
     const ok = verify('sha256', Buffer.from(`${h}.${c}`), { key: createPublicKey(apnsPem), dsaEncoding: 'ieee-p1363' }, Buffer.from(s!, 'base64url'));
     expect(ok).toBe(true);
 
-    await sender.send(device({ app: 'com.lightningpiggy.app.dev', apnsEnv: 'sandbox' }), { category: 'dm', count: 3, eventKind: 1059 });
+    await sender.send(device({ app: 'com.lightningpiggy.app.dev', apnsEnv: 'sandbox' }), { category: 'dm', count: 3 });
     expect(calls[1]![0]).toBe(APNS_SANDBOX);
     expect(JSON.parse(calls[1]![3]).aps.alert.body).toBe('3 new messages');
   });
@@ -68,7 +68,7 @@ describe('ApnsSender', () => {
         { keyPem: apnsPem, keyId: 'K', teamId: 'T' },
         async () => ({ status, body: JSON.stringify({ reason }) }),
       );
-      expect(await sender.send(device(), { category: 'dm', count: 1, eventKind: 4 })).toBe(want);
+      expect(await sender.send(device(), { category: 'dm', count: 1 })).toBe(want);
     }
   });
 
@@ -79,7 +79,7 @@ describe('ApnsSender', () => {
       [503, { retry: true }],
     ] as const) {
       const sender = new ApnsSender({ keyPem: apnsPem, keyId: 'K', teamId: 'T' }, async () => ({ status, body: '{}' }));
-      expect(await sender.send(device(), { category: 'dm', count: 1, eventKind: 4 })).toEqual(want);
+      expect(await sender.send(device(), { category: 'dm', count: 1 })).toEqual(want);
     }
   });
 
@@ -91,7 +91,7 @@ describe('ApnsSender', () => {
       valid = false; // unregistered while the first request was in flight
       return { status: 403, body: '{"reason":"ExpiredProviderToken"}' };
     });
-    expect(await sender.send(device(), { category: 'dm', count: 1, eventKind: 4 }, () => valid)).toBe('cancelled');
+    expect(await sender.send(device(), { category: 'dm', count: 1 }, () => valid)).toBe('cancelled');
     expect(n).toBe(1);
   });
 
@@ -106,7 +106,7 @@ describe('ApnsSender', () => {
     const sender = new ApnsSender({ keyPem: apnsPem, keyId: 'K', teamId: 'T' }, (_o, path, headers, body) =>
       transport(`http://127.0.0.1:${port}`, path, headers, body),
     );
-    expect(await sender.send(device(), { category: 'dm', count: 1, eventKind: 4 })).toEqual({ retry: true });
+    expect(await sender.send(device(), { category: 'dm', count: 1 })).toEqual({ retry: true });
     server.close();
   });
 
@@ -129,7 +129,7 @@ describe('ApnsSender', () => {
     const sender = new ApnsSender({ keyPem: apnsPem, keyId: 'K', teamId: 'T' }, async () =>
       ++n === 1 ? { status: 403, body: '{"reason":"ExpiredProviderToken"}' } : { status: 200, body: '' },
     );
-    expect(await sender.send(device(), { category: 'dm', count: 1, eventKind: 4 })).toBe('ok');
+    expect(await sender.send(device(), { category: 'dm', count: 1 })).toBe('ok');
     expect(n).toBe(2);
   });
 });
@@ -145,8 +145,8 @@ describe('FcmSender', () => {
       return { status: 200, text: async () => '{"name":"projects/proj-1/messages/1"}' };
     });
     const d = device({ platform: 'fcm', token: 'tok-123' });
-    expect(await sender.send(d, { category: 'payment', count: 1, eventKind: 23197 })).toBe('ok');
-    expect(await sender.send(d, { category: 'mention', count: 2, eventKind: 1 })).toBe('ok');
+    expect(await sender.send(d, { category: 'payment', count: 1 })).toBe('ok');
+    expect(await sender.send(d, { category: 'mention', count: 2 })).toBe('ok');
     expect(calls.filter((c) => c.url.includes('oauth2'))).toHaveLength(1); // cached
     const assertion = new URLSearchParams(calls[0]!.body).get('assertion')!;
     const [h, c, s] = assertion.split('.');
@@ -157,7 +157,7 @@ describe('FcmSender', () => {
     const msg = JSON.parse(calls[1]!.body).message;
     expect(msg.token).toBe('tok-123');
     expect(msg.notification).toEqual({ title: 'Lightning Piggy', body: 'Payment received' });
-    expect(msg.data).toEqual({ source: 'lp-watcher', category: 'payment', kind: '23197' });
+    expect(msg.data).toEqual({ source: 'lp-watcher', category: 'payment' }); // no Nostr kind
     expect(msg.android.notification).toEqual({ tag: 'lp-payment', channel_id: 'payments' });
     expect(JSON.parse(calls[2]!.body).message.notification.body).toBe('2 new mentions');
   });
@@ -178,7 +178,7 @@ describe('FcmSender', () => {
     const sender = new FcmSender(sa, async (url) =>
       url.includes('oauth2') ? { status: 200, text: async () => '{"access_token":"t"}' } : { status: 400, text: async () => malformed },
     );
-    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1, eventKind: 4 })).toBe('invalid-token');
+    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1 })).toBe('invalid-token');
   });
 
   it('waits at least a minute on quota errors without Retry-After, and consumes success bodies', async () => {
@@ -188,11 +188,11 @@ describe('FcmSender', () => {
         ? { status: 200, text: async () => '{"access_token":"t"}' }
         : { status: 429, text: async () => (read++, '{}') },
     );
-    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1, eventKind: 4 })).toEqual({ retry: true, quota: true });
+    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1 })).toEqual({ retry: true, quota: true });
     const ok = new FcmSender(sa, async (url) =>
       url.includes('oauth2') ? { status: 200, text: async () => '{"access_token":"t"}' } : { status: 200, text: async () => (read++, '{}') },
     );
-    await ok.send(device({ platform: 'fcm' }), { category: 'dm', count: 1, eventKind: 4 });
+    await ok.send(device({ platform: 'fcm' }), { category: 'dm', count: 1 });
     expect(read).toBe(2);
   });
 
@@ -207,7 +207,7 @@ describe('FcmSender', () => {
       pushes++;
       return { status: 200, text: async () => '{}' };
     });
-    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1, eventKind: 4 }, () => valid)).toBe('cancelled');
+    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1 }, () => valid)).toBe('cancelled');
     expect(pushes).toBe(0);
   });
 
@@ -217,7 +217,7 @@ describe('FcmSender', () => {
         ? { status: 200, text: async () => '{"access_token":"t"}' }
         : { status: 429, text: async () => '{"error":{"status":"RESOURCE_EXHAUSTED"}}', headers: { get: () => '7' } },
     );
-    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1, eventKind: 4 })).toEqual({ retry: true, quota: true, afterMs: 7000 });
+    expect(await sender.send(device({ platform: 'fcm' }), { category: 'dm', count: 1 })).toEqual({ retry: true, quota: true, afterMs: 7000 });
     expect(retryAfterMs('9999')).toBe(9_999_000); // not shortened; the notifier drops what it can't honour
     expect(retryAfterMs(null)).toBeUndefined();
   });
@@ -248,6 +248,7 @@ describe('Notifier', () => {
           return true;
         },
         isCurrent: () => current,
+        markValidated: () => {},
       },
       senders: { fcm: sender },
       coalesceWindowSec: 30,
@@ -259,8 +260,8 @@ describe('Notifier', () => {
 
   it('coalesces bursts per (user, category): one immediate push, one summary per window', async () => {
     const { notifier, sent } = setup();
-    for (let i = 0; i < 5; i++) notifier.notify('u', 'dm', 1059);
-    notifier.notify('u', 'zap', 9735);
+    for (let i = 0; i < 5; i++) notifier.notify('u', 'dm');
+    notifier.notify('u', 'zap');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual([
       { count: 1, category: 'dm' },
@@ -271,7 +272,7 @@ describe('Notifier', () => {
     expect(sent).toHaveLength(3);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(sent).toHaveLength(3); // quiet: nothing more
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toHaveLength(4);
   });
@@ -279,14 +280,14 @@ describe('Notifier', () => {
   it('skips devices with the category off', async () => {
     const { notifier, sent } = setup();
     notifier['deps'].store.devicesFor = () => [device({ platform: 'fcm', categories: { dm: false, zap: true, mention: true, payment: true } })];
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toHaveLength(0);
   });
 
   it('rate-limits per device', async () => {
     const { notifier, sent } = setup('ok', 2);
-    for (const c of ['dm', 'zap', 'mention', 'payment'] as const) notifier.notify('u', c, 1);
+    for (const c of ['dm', 'zap', 'mention', 'payment'] as const) notifier.notify('u', c);
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toHaveLength(2);
     expect(notifier.stats.rateLimited).toBe(2);
@@ -295,7 +296,7 @@ describe('Notifier', () => {
   it('does not send to registrations that changed after the job was queued', async () => {
     const { notifier, sent, setCurrent } = setup();
     setCurrent(false);
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toHaveLength(0);
     expect(notifier.stats.dropped).toBe(1);
@@ -303,7 +304,7 @@ describe('Notifier', () => {
 
   it('backs off quota errors from 60 s and never retries before Retry-After', async () => {
     const { notifier, sent } = setup(() => ({ retry: true, quota: true, afterMs: 7_000 }));
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(59_000);
     expect(sent).toHaveLength(1); // 7 s Retry-After does not shorten the 60 s quota floor
     await vi.advanceTimersByTimeAsync(62_000);
@@ -312,7 +313,7 @@ describe('Notifier', () => {
 
   it('drops retries whose required delay outlives the job', async () => {
     const { notifier, sent } = setup(() => ({ retry: true, afterMs: 3_600_000 }));
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toHaveLength(1);
     expect(notifier.stats.retried).toBe(0);
@@ -322,7 +323,7 @@ describe('Notifier', () => {
   it('counts deferred retries against the work budget', async () => {
     const many = Array.from({ length: 30 }, (_, i) => device({ platform: 'fcm', tokenHash: `h${i}` }));
     const notifier = new Notifier({
-      store: { devicesFor: () => many, removeRegistration: () => false, isCurrent: () => true },
+      store: { devicesFor: () => many, removeRegistration: () => false, isCurrent: () => true, markValidated: () => {} },
       senders: { fcm: { send: async () => ({ retry: true }) } },
       coalesceWindowSec: 30,
       devicePushesPerHour: 60,
@@ -330,7 +331,7 @@ describe('Notifier', () => {
       queueMax: 5,
       onRegistrationsChanged: () => {},
     });
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(0);
     expect(notifier['retryTimers'].size + notifier['queue'].length).toBeLessThanOrEqual(5);
     expect(notifier.stats.dropped).toBeGreaterThan(0);
@@ -338,7 +339,7 @@ describe('Notifier', () => {
 
   it('retries transient failures a bounded number of times', async () => {
     const { notifier, sent } = setup(() => ({ retry: true }));
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(60_000);
     expect(sent).toHaveLength(3); // first try + 2 retries
     expect(notifier.stats.retried).toBe(2);
@@ -350,7 +351,7 @@ describe('Notifier', () => {
     let peak = 0;
     const many = Array.from({ length: 20 }, (_, i) => device({ platform: 'fcm', tokenHash: `h${i}` }));
     const notifier = new Notifier({
-      store: { devicesFor: () => many, removeRegistration: () => false, isCurrent: () => true },
+      store: { devicesFor: () => many, removeRegistration: () => false, isCurrent: () => true, markValidated: () => {} },
       senders: {
         fcm: {
           send: async () => {
@@ -366,7 +367,7 @@ describe('Notifier', () => {
       concurrency: 4,
       onRegistrationsChanged: () => {},
     });
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(1_000);
     expect(notifier.stats.delivered).toBe(20);
     expect(peak).toBe(4);
@@ -374,7 +375,7 @@ describe('Notifier', () => {
 
   it('removes registrations whose token is invalid', async () => {
     const { notifier, removed, changed } = setup('invalid-token');
-    notifier.notify('u', 'dm', 4);
+    notifier.notify('u', 'dm');
     await vi.advanceTimersByTimeAsync(0);
     expect(removed).toEqual(['h1@100']); // exactly the version that was sent
     expect(changed()).toBe(1);

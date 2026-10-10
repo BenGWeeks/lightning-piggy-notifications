@@ -10,8 +10,11 @@
 // * Transient provider failures are retried (bounded, with backoff or the
 //   provider's Retry-After). Dead tokens remove exactly the registration
 //   version that was sent.
+// * Logging: outcomes are counted per category (Activity) and logged in
+//   aggregate; per-delivery lines are debug-only, with per-process pseudonyms.
 
-import { errCode, log, short } from './log.js';
+import type { Activity } from './activity.js';
+import { errCode, log, logs, pseudonym, warnThrottled } from './log.js';
 import type { Category } from './registration.js';
 import type { Device, Store } from './store.js';
 import { isRetry, type PushNotification, type PushResult, type PushSender } from './push/types.js';
@@ -19,7 +22,6 @@ import { isRetry, type PushNotification, type PushResult, type PushSender } from
 interface Window {
   timer: NodeJS.Timeout;
   pending: number;
-  lastKind: number;
 }
 
 interface Job {
@@ -35,7 +37,7 @@ const MAX_RETRIES = 2;
 const JOB_TTL_MS = 10 * 60_000;
 
 export interface NotifierDeps {
-  store: Pick<Store, 'devicesFor' | 'removeRegistration' | 'isCurrent'>;
+  store: Pick<Store, 'devicesFor' | 'removeRegistration' | 'isCurrent' | 'markValidated'>;
   senders: { apns?: PushSender; fcm?: PushSender };
   coalesceWindowSec: number;
   devicePushesPerHour: number;
@@ -43,6 +45,8 @@ export interface NotifierDeps {
   queueMax?: number;
   /** Called after registrations were removed (invalid tokens) so routing can rebuild. */
   onRegistrationsChanged: () => void;
+  /** Aggregate per-category outcome counters (the only info-level delivery logging). */
+  activity?: Activity;
   now?: () => number;
 }
 
@@ -66,23 +70,24 @@ export class Notifier {
   private readonly retryTimers = new Set<NodeJS.Timeout>();
   private idleWaiters: (() => void)[] = [];
   private stopped = false;
+  /** Set when drain() returns: the store may be closed, so late results never touch it. */
+  private detached = false;
 
   constructor(private readonly deps: NotifierDeps) {
     this.now = deps.now ?? Date.now;
   }
 
   /** An event matched (user, category). */
-  notify(user: string, category: Category, eventKind: number): void {
+  notify(user: string, category: Category): void {
     if (this.stopped) return;
     const key = `${user}|${category}`;
     const w = this.windows.get(key);
     if (w) {
       w.pending++;
-      w.lastKind = eventKind;
       return;
     }
     this.openWindow(key, user, category);
-    this.fanOut(user, { category, count: 1, eventKind });
+    this.fanOut(user, { category, count: 1 });
   }
 
   private openWindow(key: string, user: string, category: Category): void {
@@ -91,11 +96,11 @@ export class Notifier {
       this.windows.delete(key);
       if (cur && cur.pending > 0 && !this.stopped) {
         this.openWindow(key, user, category);
-        this.fanOut(user, { category, count: cur.pending, eventKind: cur.lastKind });
+        this.fanOut(user, { category, count: cur.pending });
       }
     }, this.deps.coalesceWindowSec * 1000);
     timer.unref();
-    this.windows.set(key, { timer, pending: 0, lastKind: 0 });
+    this.windows.set(key, { timer, pending: 0 });
   }
 
   private fanOut(user: string, n: PushNotification): void {
@@ -109,6 +114,7 @@ export class Notifier {
     for (const device of devices) {
       if (!this.takeToken(device.tokenHash)) {
         this.stats.rateLimited++;
+        this.deps.activity?.count('rate_limited', n.category);
         continue;
       }
       this.enqueue({ device, n, attempt: 0, expiresAt: this.now() + JOB_TTL_MS });
@@ -119,6 +125,7 @@ export class Notifier {
     // One admission budget for queued + running + deferred (retry) work.
     if (this.queue.length + this.running + this.retryTimers.size >= (this.deps.queueMax ?? 10_000)) {
       this.stats.dropped++;
+      this.deps.activity?.count('dropped', job.n.category);
       return;
     }
     this.queue.push(job);
@@ -127,7 +134,7 @@ export class Notifier {
 
   private pump(): void {
     const max = this.deps.concurrency ?? 32;
-    while (this.running < max && this.queue.length > 0) {
+    while (!this.stopped && this.running < max && this.queue.length > 0) {
       const job = this.queue.shift()!;
       this.running++;
       this.send(job)
@@ -158,11 +165,12 @@ export class Notifier {
     const { device: d, n } = job;
     const sender = d.platform === 'apns' ? this.deps.senders.apns : this.deps.senders.fcm;
     if (!sender) {
-      log.warn('no sender configured for platform', { platform: d.platform });
+      warnThrottled(`no sender ${d.platform}`, 'no sender configured for platform', { platform: d.platform });
       return;
     }
     if (this.now() > job.expiresAt) {
       this.stats.dropped++;
+      this.deps.activity?.count('dropped', n.category);
       return;
     }
     // The registration may have been unregistered, refreshed or narrowed since
@@ -175,6 +183,7 @@ export class Notifier {
     }
     if (!current) {
       this.stats.dropped++;
+      this.deps.activity?.count('dropped', n.category);
       return;
     }
     const stillValid = () => {
@@ -189,25 +198,33 @@ export class Notifier {
     try {
       result = await sender.send(d, n, stillValid);
     } catch (e) {
-      log.warn('push send threw', { err: errCode(e) });
+      warnThrottled(`send threw ${errCode(e)}`, 'push send threw', { err: errCode(e) });
       result = { retry: true };
     }
-    const fields = {
-      user: short(d.user),
-      category: n.category,
-      count: n.count,
-      platform: d.platform,
-      app: d.app,
-      device: short(d.tokenHash),
-      attempt: job.attempt,
-    };
+    // Per-delivery lines (even without identifiers, their timing is a
+    // delivery timeline) are debug-only; info gets the aggregate counters.
+    const detail = () =>
+      logs('debug')
+        ? { category: n.category, platform: d.platform, app: d.app, attempt: job.attempt, count: n.count, user: pseudonym(d.user), device: pseudonym(d.tokenHash) }
+        : {};
+    const activity = this.deps.activity;
+    if (this.detached) return; // finished after shutdown: the store may be closed
     if (result === 'cancelled') {
       this.stats.dropped++;
+      activity?.count('dropped', n.category);
     } else if (result === 'ok') {
       this.stats.delivered++;
-      log.info('push delivered', fields);
+      activity?.count('delivered', n.category);
+      log.debug('push delivered', detail());
+      try {
+        // A delivery proves the token: the registration is no longer provisional.
+        this.deps.store.markValidated(d.user, d.tokenHash, d.ts, Math.floor(this.now() / 1000));
+      } catch (e) {
+        log.error('registration validation update failed', { err: e as Error });
+      }
     } else if (result === 'invalid-token') {
       this.stats.invalidTokens++;
+      activity?.count('invalid_tokens', n.category);
       this.buckets.delete(d.tokenHash);
       let removed = false;
       try {
@@ -215,7 +232,7 @@ export class Notifier {
       } catch (e) {
         log.error('registration removal failed', { err: e as Error });
       }
-      log.info('push token invalid; registration removed', { ...fields, removed });
+      log.debug('push token invalid; registration removed', { ...detail(), removed });
       if (removed) this.deps.onRegistrationsChanged();
     } else if (
       isRetry(result) &&
@@ -227,6 +244,7 @@ export class Notifier {
       // Never retry earlier than the provider asked; if that's past the job's
       // lifetime (or the budget is full) the push is dropped instead.
       this.stats.retried++;
+      activity?.count('retried', n.category);
       const delay = this.retryDelay(result, job.attempt);
       const t = setTimeout(() => {
         this.retryTimers.delete(t);
@@ -234,10 +252,11 @@ export class Notifier {
       }, delay);
       t.unref();
       this.retryTimers.add(t);
-      log.info('push deferred for retry', { ...fields, delay_ms: Math.round(delay) });
+      log.debug('push deferred for retry', { ...detail(), delay_ms: Math.round(delay) });
     } else {
       this.stats.failed++;
-      log.warn('push failed', fields);
+      activity?.count('failed', n.category);
+      log.debug('push failed', detail());
     }
   }
 
@@ -250,18 +269,26 @@ export class Notifier {
     return Math.max(r.afterMs ?? 0, base + j * base);
   }
 
-  /** Stop accepting work, drop timers, and wait for in-flight sends (graceful shutdown). */
+  /**
+   * Graceful shutdown: stop accepting work, drop timers and queued jobs, and
+   * wait (bounded) for in-flight sends. After it returns, any send still
+   * finishing is ignored, so nothing touches the store once it is closed.
+   */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.stopped = true;
     for (const w of this.windows.values()) clearTimeout(w.timer);
     this.windows.clear();
     for (const t of this.retryTimers) clearTimeout(t);
     this.retryTimers.clear();
-    if (this.running === 0 && this.queue.length === 0) return;
-    await Promise.race([
-      new Promise<void>((r) => this.idleWaiters.push(r)),
-      new Promise<void>((r) => setTimeout(r, timeoutMs).unref()),
-    ]);
+    this.stats.dropped += this.queue.length;
+    this.queue.length = 0;
+    if (this.running > 0) {
+      await Promise.race([
+        new Promise<void>((r) => this.idleWaiters.push(r)),
+        new Promise<void>((r) => setTimeout(r, timeoutMs).unref()),
+      ]);
+    }
+    this.detached = true;
   }
 
   /** Bound memory: forget buckets that have fully refilled. */

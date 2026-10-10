@@ -315,7 +315,7 @@ describe('Store replay protection', () => {
   it('watermark bookkeeping is O(1) per request (no table scans)', () => {
     const s = new Store(':memory:', Buffer.alloc(32, 1), { ...DEFAULT_LIMITS, maxWatermarkUsers: 50_000 });
     const db = (s as unknown as { db: { prepare: (q: string) => { run: (...a: unknown[]) => unknown } } }).db;
-    const ins = db.prepare('INSERT INTO user_watermarks (user, ts, active) VALUES (?, ?, 0)');
+    const ins = db.prepare('INSERT INTO user_watermarks (user_idx, ts, active) VALUES (?, ?, 0)');
     for (let i = 0; i < 40_000; i++) ins.run(i.toString(16).padStart(64, '0'), nowSec);
     (s as unknown as { reconcileWatermarks: () => void }).reconcileWatermarks();
     const reqs = Array.from({ length: 100 }, () => asUser(generateSecretKey(), regContent({ action: 'unregister' }, nowSec)));

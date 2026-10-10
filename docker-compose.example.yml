@@ -33,6 +33,13 @@ services:
     secrets:
       - watcher_private_key
       - watcher_token_key
+    # Bounded logs. At LOG_LEVEL=info they hold only aggregate activity
+    # counters, but rotate them anyway (debug logs are per-event).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 secrets:
   watcher_private_key:

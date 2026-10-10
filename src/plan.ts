@@ -4,9 +4,15 @@
 //   registered user's filters; user-listed relays carry only their users.
 // * User relays are capped globally (most-referenced first) so registrations
 //   can't make the watcher fan out to an unbounded number of hosts.
-// * #p values are chunked (<= limits.pTagChunk per filter) and users are
-//   grouped by the exact kind set they need, so a user with mentions off
-//   doesn't pull kind-1 traffic.
+// * Privacy: relays should learn only that a pubkey is watched, not what the
+//   user toggled. Every watched user gets the same filters — one superset
+//   regular-kinds filter (4, 1, 9735) and one gift-wrap filter per #p chunk —
+//   and the router drops what a user didn't enable. NWC client keys (which
+//   would otherwise be linkable to the user by filter grouping on every
+//   default relay) are only sent to relays that user listed, i.e. their
+//   wallet's relay; they are sent whenever the registration lists NWC
+//   connections, whether or not payment pushes are on.
+// * #p values are chunked (<= limits.pTagChunk per filter).
 // * Chunks of the same mode are packed into multi-filter REQs (<=
 //   limits.filtersPerReq filters each), bounding subscriptions per relay.
 // * Subscription ids are a hash of the filters (minus `since`), so re-planning
@@ -122,43 +128,31 @@ export function selectUserRelays(regs: readonly RegistrationSummary[], defaults:
 }
 
 interface Wants {
-  /** pubkey -> regular kinds wanted (4 / 1 / 9735). */
-  regular: Map<string, Set<number>>;
-  wraps: Set<string>;
+  /** Watched user pubkeys: every one gets the same (superset) filters. */
+  users: Set<string>;
   nwc: Set<string>;
 }
 
-const emptyWants = (): Wants => ({ regular: new Map(), wraps: new Set(), nwc: new Set() });
+/** Regular kinds every watched user is subscribed to, whatever they enabled. */
+export const REGULAR_KINDS = [KIND_MENTION, KIND_DM4, KIND_ZAP];
 
-function addWants(w: Wants, r: RegistrationSummary): void {
-  const kinds = w.regular.get(r.user) ?? new Set<number>();
-  if (r.categories.dm) {
-    kinds.add(KIND_DM4);
-    w.wraps.add(r.user);
-  }
-  if (r.categories.zap) kinds.add(KIND_ZAP);
-  if (r.categories.mention) kinds.add(KIND_MENTION);
-  if (kinds.size) w.regular.set(r.user, kinds);
-  if (r.categories.payment) for (const n of r.nwc) w.nwc.add(n.client);
+const emptyWants = (): Wants => ({ users: new Set(), nwc: new Set() });
+
+function addWants(w: Wants, r: RegistrationSummary, withNwc: boolean): void {
+  if (!Object.values(r.categories).some(Boolean)) return;
+  w.users.add(r.user);
+  // Independent of the payment toggle (the router applies it), so the filter
+  // doesn't change when the user turns payment pushes on or off.
+  if (withNwc) for (const n of r.nwc) w.nwc.add(n.client);
 }
 
 function specsFor(w: Wants, pTagChunk: number): FilterSpec[] {
   const out: FilterSpec[] = [];
-  // Group users by identical kind sets.
-  const groups = new Map<string, string[]>();
-  for (const [pk, kinds] of w.regular) {
-    const key = [...kinds].sort((a, b) => a - b).join(',');
-    const g = groups.get(key) ?? [];
-    g.push(pk);
-    groups.set(key, g);
+  const users = [...w.users].sort();
+  for (const part of chunk(users, pTagChunk)) {
+    out.push({ mode: 'live', filter: { kinds: REGULAR_KINDS, '#p': part }, sinceAgoSec: LIVE_SINCE_SLACK_SEC });
   }
-  for (const [key, pks] of [...groups.entries()].sort()) {
-    const kinds = key.split(',').map(Number);
-    for (const part of chunk(pks.sort(), pTagChunk)) {
-      out.push({ mode: 'live', filter: { kinds, '#p': part }, sinceAgoSec: LIVE_SINCE_SLACK_SEC });
-    }
-  }
-  for (const part of chunk([...w.wraps].sort(), pTagChunk)) {
+  for (const part of chunk(users, pTagChunk)) {
     out.push({ mode: 'wrap', filter: { kinds: [KIND_WRAP], '#p': part, limit: WRAP_LIMIT } });
   }
   for (const part of chunk([...w.nwc].sort(), pTagChunk)) {
@@ -181,8 +175,9 @@ export function buildPlan(
   for (const url of opts.defaultRelays) wantsFor(url);
 
   for (const r of regs) {
-    for (const url of opts.defaultRelays) addWants(wantsFor(url), r);
-    for (const url of r.relays) if (userRelays.has(url)) addWants(wantsFor(url), r);
+    // NWC filters only where the user listed the relay (their wallet's relay).
+    for (const url of opts.defaultRelays) addWants(wantsFor(url), r, r.relays.includes(url));
+    for (const url of r.relays) if (userRelays.has(url)) addWants(wantsFor(url), r, true);
   }
 
   const plan: Plan = new Map();

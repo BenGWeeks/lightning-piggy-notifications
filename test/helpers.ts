@@ -49,6 +49,7 @@ export function testConfig(over: Partial<Config> = {}): Config {
     healthHost: '127.0.0.1',
     healthPort: 0,
     logLevel: 'error',
+    activityLogSec: 0,
     allowInsecureRelays: true,
     limits: { ...DEFAULT_LIMITS },
     ...over,

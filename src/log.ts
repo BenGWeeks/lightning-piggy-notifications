@@ -1,11 +1,23 @@
-// Structured JSON logging. Privacy rule: never log device tokens, event
-// content, or full pubkeys/event ids — use `short()` for identifiers.
+// Structured JSON logging.
+//
+// Privacy rules:
+// * Never log device tokens, event content, raw network error messages, or
+//   full pubkeys/event ids.
+// * At `info` and above, never log anything that identifies a user or device
+//   (not even truncated): per-event and per-delivery activity is aggregated
+//   into a periodic `activity` line (see activity.ts). Per-user detail is
+//   `debug` only, and there identifiers go through `pseudonym()`, a keyed hash
+//   with a random per-process key, so lines can be correlated within one run
+//   but not linked to the database (or to another run's logs).
+
+import { createHmac, randomBytes } from 'node:crypto';
 
 type Level = 'debug' | 'info' | 'warn' | 'error';
 const ORDER: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
 let threshold: number = ORDER.info;
 let sink: (line: string) => void = (line) => process.stdout.write(line + '\n');
+const PSEUDONYM_KEY = randomBytes(32);
 
 export function setLogLevel(level: string): void {
   threshold = ORDER[(level as Level) in ORDER ? (level as Level) : 'info'];
@@ -16,10 +28,18 @@ export function setLogSink(fn: (line: string) => void): void {
   sink = fn;
 }
 
-/** First 8 chars of an identifier — enough to correlate, not to identify. */
-export function short(id: string | undefined | null): string {
+/** Is `level` currently emitted? (skip building expensive debug fields otherwise) */
+export function logs(level: Level): boolean {
+  return ORDER[level] >= threshold;
+}
+
+/**
+ * Opaque per-process pseudonym for an identifier (debug logs only): stable
+ * within this process, unlinkable to the stored pubkey/token or across restarts.
+ */
+export function pseudonym(id: string | undefined | null): string {
   if (!id) return '-';
-  return id.length <= 8 ? id : `${id.slice(0, 8)}…`;
+  return createHmac('sha256', PSEUDONYM_KEY).update(id).digest('hex').slice(0, 10);
 }
 
 function emit(level: Level, msg: string, fields?: Record<string, unknown>): void {
@@ -40,6 +60,26 @@ export const log = {
   warn: (msg: string, f?: Record<string, unknown>) => emit('warn', msg, f),
   error: (msg: string, f?: Record<string, unknown>) => emit('error', msg, f),
 };
+
+const throttled = new Map<string, { until: number; suppressed: number }>();
+
+/**
+ * A warning that can recur per delivery (provider rejections, transport
+ * errors): at most one line per `key` per window, carrying how many were
+ * suppressed since the last one — so provider health stays visible without
+ * the log becoming a per-delivery timeline.
+ */
+export function warnThrottled(key: string, msg: string, fields: Record<string, unknown> = {}, windowMs = 5 * 60_000): void {
+  const t = Date.now();
+  const e = throttled.get(key);
+  if (e && t < e.until) {
+    e.suppressed++;
+    return;
+  }
+  if (throttled.size > 1_000) throttled.clear();
+  throttled.set(key, { until: t + windowMs, suppressed: 0 });
+  emit('warn', msg, e?.suppressed ? { ...fields, suppressed: e.suppressed } : fields);
+}
 
 /** Log-safe error: its code (e.g. ECONNREFUSED) or class name, never a raw message. */
 export function errCode(e: unknown): string {

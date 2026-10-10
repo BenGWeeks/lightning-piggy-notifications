@@ -70,7 +70,7 @@ describe('watcher end to end', () => {
     relay.publish(zap);
     relay.publish(zap); // duplicate delivery is deduped
     await waitFor(() => sent.length === 1);
-    expect(sent[0]!.n).toMatchObject({ category: 'zap', count: 1, eventKind: 9735 });
+    expect(sent[0]!.n).toEqual({ category: 'zap', count: 1 });
     expect(sent[0]!.device.token).toBe(FCM_TOKEN);
     expect(sent[0]!.device.app).toBe('com.lightningpiggy.app');
   });
