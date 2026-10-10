@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-Only the latest commit on `main` is supported. Deployments pin a commit (see
-the README's self-hosting notes), so upgrade to the latest `main` before you
-report, if you can.
+Only the latest commit on `main` is supported. Please check that the problem
+still exists on the latest `main` before you report, and say which commit you
+tested.
 
 | Version | Supported |
 |---|---|
@@ -15,7 +15,8 @@ report, if you can.
 
 **Please don't open a public issue.** Report privately through GitHub:
 **Security → Report a vulnerability** on this repository. That opens a private
-security advisory that only the maintainers can see.
+security advisory that only the maintainers, you, and any collaborators invited
+to the advisory can see.
 
 Please include:
 
