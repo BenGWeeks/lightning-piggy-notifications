@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (privately)
+    url: https://github.com/BenGWeeks/lightning-piggy-watcher/security/advisories/new
+    about: Never open a public issue for a vulnerability. See SECURITY.md.
+  - name: Security policy
+    url: https://github.com/BenGWeeks/lightning-piggy-watcher/blob/main/SECURITY.md
+    about: Supported versions, scope, and what not to include in reports.
+  - name: Lightning Piggy app issues
+    url: https://github.com/BenGWeeks/lightning-piggy-mobile/issues
+    about: Problems with the app itself (not the watcher service) belong there.

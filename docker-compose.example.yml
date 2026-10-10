@@ -2,7 +2,7 @@
 # Secrets are files (mode 600, owned by the container user) — never in git.
 services:
   lightning-piggy-watcher:
-    image: lightning-piggy-notifications:0.1.0
+    image: lightning-piggy-watcher:0.1.0
     build: .
     container_name: lightning-piggy-watcher
     restart: unless-stopped

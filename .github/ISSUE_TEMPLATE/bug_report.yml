@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in the watcher doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste secrets.** That means device push tokens, Nostr private keys (nsec or hex), NWC connection strings (`nostr+walletconnect://…?secret=…`), APNs `.p8` keys, FCM service-account JSON, the token key file, or unredacted production logs or databases. Use test values, or redact them.
+
+        **Security problems** go through [private reporting](https://github.com/BenGWeeks/lightning-piggy-watcher/security/advisories/new), not here. See [SECURITY.md](https://github.com/BenGWeeks/lightning-piggy-watcher/blob/main/SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps. A failing test against the in-memory relay (`test/helpers.ts`) is ideal.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The watcher commit you run (the pinned SHA or image tag).
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Registration (kind 8480 / gift wrap)
+        - Relay subscriptions / routing
+        - Push delivery (APNs)
+        - Push delivery (FCM)
+        - Storage / migration
+        - Logging / health endpoints
+        - Docs (README / PROTOCOL)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Node version or Docker, the relays you use, and any WATCHER_* settings you changed from the defaults. Leave out secret file contents.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (redacted)
+      description: Relevant JSON log lines. `info` logs hold no user identifiers, but check anyway. Remove anything secret.
+      render: shell
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Checks
+      options:
+        - label: This report contains no tokens, keys, nsecs, NWC secrets or unredacted production data.
+          required: true

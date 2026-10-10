@@ -1,4 +1,4 @@
-# Lightning Piggy notifications (watcher)
+# Lightning Piggy Watcher
 
 A small, open-source TypeScript/Node service that sends **privacy-preserving push
 notifications** for Nostr events. [Lightning Piggy](https://github.com/BenGWeeks/lightning-piggy-mobile)
@@ -312,6 +312,12 @@ The tests (vitest) cover:
   budget, provisional eviction), encryption at rest and the v1 migration,
   hashed notified ids, retention, uniform relay filters;
 - an end-to-end run against an in-memory relay.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
+Never put tokens, keys or nsecs in an issue.
 
 ## License
 
