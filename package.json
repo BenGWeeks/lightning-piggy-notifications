@@ -1,5 +1,5 @@
 {
-  "name": "lightning-piggy-notifications",
+  "name": "lightning-piggy-watcher",
   "version": "0.1.0",
   "description": "Privacy-preserving push notifications for Nostr DMs, zaps, mentions and NWC payments (Lightning Piggy).",
   "main": "dist/index.js",
@@ -34,6 +34,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/BenGWeeks/lightning-piggy-notifications.git"
+    "url": "https://github.com/BenGWeeks/lightning-piggy-watcher.git"
   }
 }

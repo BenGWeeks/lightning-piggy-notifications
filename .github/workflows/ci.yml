@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t lightning-piggy-notifications:ci .
+      - run: docker build -t lightning-piggy-watcher:ci .
 
   gitleaks:
     runs-on: ubuntu-latest

@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an improvement to the watcher or its protocol.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The watcher is privacy-first: pushes carry generic text only, and it stores and logs as little as possible. Please say how your idea fits that.
+
+        **Never paste secrets.** That means device tokens, keys, nsecs or NWC connection strings.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, or what's hard?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: "What should change? If it changes the registration format, how does it stay compatible with `v: 1` (see PROTOCOL.md)?"
+    validations:
+      required: true
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy impact
+      description: Does it change what the operator, relays, Apple or Google, or the logs can learn? See the README's threat model.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
