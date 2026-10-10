@@ -36,7 +36,9 @@ export function parsePubkey(raw: string | undefined): string {
 
 function main(argv: string[]): void {
   const [cmd, arg, val] = argv;
-  if (!cmd || !['stats', 'list', 'purge-user', 'purge-provisional'].includes(cmd)) usage();
+  // Exact arity per command: a typo must never widen a purge.
+  const arity: Record<string, number[]> = { stats: [1], list: [1, 2], 'purge-user': [2], 'purge-provisional': [1, 3] };
+  if (!cmd || !arity[cmd] || !arity[cmd].includes(argv.length)) usage();
   setLogLevel('warn');
   const cfg = loadConfig();
   const store = new Store(cfg.dbPath, cfg.tokenKey, cfg.limits, cfg.apnsSandboxApps);

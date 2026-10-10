@@ -1,5 +1,5 @@
 // Privacy hardening: aggregate-only info logs, admission (token validation,
-// new-user budget, provisional eviction), encryption at rest + migration,
+// new-registration budget, provisional eviction), encryption at rest + migration,
 // hashed notified ids, watermark grace, admin tooling.
 
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -113,7 +113,7 @@ describe('logging: no user or device identifiers at info', () => {
   });
 });
 
-describe('admission: token validation, new-user budget, provisional eviction', () => {
+describe('admission: token validation, registration budget, provisional eviction', () => {
   it('an invalid token is refused, settled (replay stale) and never stored', () => {
     const s = new Store(':memory:', KEY, DEFAULT_LIMITS);
     const r = req(generateSecretKey(), regContent({}, nowSec - 5));
@@ -195,6 +195,13 @@ describe('admission: token validation, new-user budget, provisional eviction', (
     expect(s.apply(r, nowSec, 'unchecked')).toBe('limit');
     expect(s.countActive()).toBe(0);
     expect(s.isStale(r)).toBe(true);
+    // Users with a live registration don't draw on the check budget.
+    const s2 = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewRegistrationsPerHour: 1 });
+    const live = generateSecretKey();
+    s2.apply(req(live, regContent({}, nowSec - 30)), nowSec, 'ok');
+    for (let i = 0; i < 4; i++) s2.takeTokenCheck(nowSec);
+    expect(s2.takeTokenCheck(nowSec, getPublicKey(live))).toBe(true);
+    expect(s2.takeTokenCheck(nowSec, getPublicKey(generateSecretKey()))).toBe(false);
     const unlimited = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewRegistrationsPerHour: 0 });
     for (let i = 0; i < 1000; i++) expect(unlimited.takeTokenCheck(nowSec)).toBe(true);
   });

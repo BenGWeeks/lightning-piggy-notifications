@@ -186,9 +186,10 @@ the cap is protected by several layers:
    refused anyway. Checks run on a few background workers, so a slow provider
    never holds up other registrations (refreshes, unregisters). They are
    budgeted at 4 × `WATCHER_NEW_REGISTRATIONS_PER_HOUR` per hour, so made-up
-   tokens from fresh keys can't cause unbounded provider requests. Past the
-   budget, or with too many checks waiting, new devices are refused until the
-   app's next refresh.
+   tokens from fresh keys can't cause unbounded provider requests. Keys that
+   already hold a live registration don't draw on that budget, so such a flood
+   can't stop existing users adding a device. Past the budget, or with too
+   many checks waiting, new devices are refused until the app's next refresh.
 2. **Per-user and per-device shares.** One key holds at most
    `WATCHER_MAX_DEVICES_PER_USER` devices (default 10, 1% of the cap). An 11th
    replaces that key's least recently refreshed device. One device token can
@@ -305,7 +306,7 @@ The tests (vitest) cover:
 - routing, deduplication and coalescing;
 - APNs and FCM request building and error mapping, with HTTP mocked;
 - invalid-token cleanup;
-- privacy: aggregate-only `info` logs, admission (token checks, new-user
+- privacy: aggregate-only `info` logs, admission (token checks, new-registration
   budget, provisional eviction), encryption at rest and the v1 migration,
   hashed notified ids, retention, uniform relay filters;
 - an end-to-end run against an in-memory relay.

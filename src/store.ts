@@ -507,11 +507,15 @@ export class Store {
    * Take one provider token check from the hourly budget (4x the new
    * registration budget; unlimited if that is). Refused requests don't consume
    * the registration budget, so without this, fresh keys with made-up tokens
-   * could trigger unbounded provider requests.
+   * could trigger unbounded provider requests. Users who already hold a live
+   * registration are exempt (they are bounded by their own rate limit and
+   * device cap, and only got in through admission), so a flood of fresh keys
+   * with made-up tokens can't stop existing users from adding a device.
    */
-  takeTokenCheck(nowSec: number): boolean {
+  takeTokenCheck(nowSec: number, user?: string): boolean {
     const max = this.limits.maxNewRegistrationsPerHour * 4;
     if (max === 0) return true;
+    if (user !== undefined && this.hasLive(this.uidx(user))) return true;
     const hour = Math.floor(nowSec / HOUR);
     if (this.tokenChecks.hour !== hour) this.tokenChecks = { hour, used: 0 };
     if (this.tokenChecks.used >= max) return false;

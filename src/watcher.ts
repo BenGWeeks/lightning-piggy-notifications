@@ -387,7 +387,7 @@ export class Watcher {
     // The state may have changed while queued: re-decide before spending a request.
     let validation: Validation | undefined;
     if (this.store.isNewDevice(req) && this.store.wouldAdmit(req, now())) {
-      validation = this.store.takeTokenCheck(now()) ? await this.checkToken(req) : 'unchecked';
+      validation = this.store.takeTokenCheck(now(), req.user) ? await this.checkToken(req) : 'unchecked';
     }
     if (this.stopping) return;
     this.finishRegistration(req, validation);
