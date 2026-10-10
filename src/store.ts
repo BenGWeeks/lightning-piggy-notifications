@@ -26,17 +26,20 @@
 // timestamp window are moot and purged.
 //
 // Admission (see README "Capacity and admission"): per-user device cap, a
-// budget of new users per hour, token validation before admission (done by the
-// caller), and at capacity a validated newcomer may evict the oldest
-// provisional registration; validated registrations are never evicted for
-// capacity.
+// per-token user cap, a budget of new registrations per hour, token validation
+// before admission (done by the caller), and at capacity a validated newcomer
+// may evict the oldest provisional registration; validated registrations are
+// never evicted for capacity.
+//
+// Key safety: a keyed check value is stored, and a database opened with a
+// different key refuses to start (nothing is changed or dropped).
 //
 // The token HMAC covers (platform, app, token): a token registered under one
 // app id can never affect the same token under another.
 
 import Database from 'better-sqlite3';
 import type { Limits } from './config.js';
-import { log } from './log.js';
+import { errCode, log } from './log.js';
 import type { Category, NwcConnection, Platform, RegistrationRequest } from './registration.js';
 import { CATEGORIES } from './registration.js';
 import { TokenCrypto } from './tokenCrypto.js';
@@ -132,12 +135,14 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS registrations_updated ON registrations(updated_at);
   CREATE INDEX IF NOT EXISTS registrations_provisional ON registrations(validated_at, updated_at);
+  CREATE INDEX IF NOT EXISTS registrations_token ON registrations(token_hash);
   CREATE TABLE IF NOT EXISTS notified_events (
     id TEXT PRIMARY KEY,
     at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS notified_events_at ON notified_events(at);
   CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS meta_text (k TEXT PRIMARY KEY, v TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS user_watermarks (user_idx TEXT PRIMARY KEY, ts INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0);
   CREATE INDEX IF NOT EXISTS user_watermarks_inactive ON user_watermarks(active, ts);
 `;
@@ -145,8 +150,8 @@ const SCHEMA = `
 export class Store {
   private readonly db: Database.Database;
   private readonly crypto: TokenCrypto;
-  /** Fixed-window budget of new users admitted per hour (in memory). */
-  private newUsers = { hour: -1, used: 0 };
+  /** Fixed-window budget of new registrations admitted per hour (in memory). */
+  private newRegs = { hour: -1, used: 0 };
   /** Fixed-window budget of provider token checks per hour (in memory). */
   private tokenChecks = { hour: -1, used: 0 };
 
@@ -164,13 +169,87 @@ export class Store {
     // The admin CLI may write while the watcher runs.
     this.db.pragma('busy_timeout = 5000');
     this.crypto = new TokenCrypto(tokenKey);
+    this.verifyKey();
     if (this.columns('registrations').includes('user')) this.migrateV1();
     this.db.exec(SCHEMA);
     this.db.prepare(`INSERT OR IGNORE INTO meta (k, v) VALUES ('schema_version', ?)`).run(SCHEMA_VERSION);
+    this.db.prepare(`INSERT OR IGNORE INTO meta_text (k, v) VALUES ('key_check', ?)`).run(this.keyCheck());
+    if (this.metaValue('cleanup_pending')) this.cleanup();
     // Every live user holds a reserved replay-watermark row (backfill).
     this.db.exec(`INSERT OR IGNORE INTO user_watermarks (user_idx, ts)
       SELECT DISTINCT user_idx, COALESCE((SELECT v FROM meta WHERE k = 'reject_new_before'), 0) FROM registrations`);
     this.reconcileWatermarks();
+  }
+
+  private keyCheck(): string {
+    return this.crypto.index('key-check', 'lp-watcher');
+  }
+
+  private metaValue(k: string): number | undefined {
+    if (!this.columns('meta').length) return undefined;
+    return (this.db.prepare(`SELECT v FROM meta WHERE k = ?`).get(k) as { v: number } | undefined)?.v;
+  }
+
+  /**
+   * Refuse to open a database with a different key than it was written with:
+   * otherwise every row would look tampered with and be dropped. Checked
+   * against the stored key-check value, or (older databases) by decrypting
+   * one row. Throws without changing anything.
+   */
+  private verifyKey(): void {
+    const fail = () => {
+      throw new Error('the token key does not match this database; refusing to start (nothing was changed)');
+    };
+    if (this.columns('meta_text').length) {
+      const stored = (this.db.prepare(`SELECT v FROM meta_text WHERE k = 'key_check'`).get() as { v: string } | undefined)?.v;
+      if (stored !== undefined) {
+        if (stored !== this.keyCheck()) fail();
+        return;
+      }
+    }
+    const cols = this.columns('registrations');
+    if (cols.includes('user')) {
+      const r = this.db
+        .prepare('SELECT user, token_hash, app, platform, token_enc FROM registrations WHERE token_enc IS NOT NULL LIMIT 1')
+        .get() as { user: string; token_hash: string; app: string; platform: string; token_enc: Buffer } | undefined;
+      if (r) {
+        try {
+          this.crypto.decrypt(r.token_enc, this.tokenAad(r.user, r.token_hash, r.app, r.platform));
+        } catch {
+          fail();
+        }
+      }
+    } else if (cols.includes('ident_enc')) {
+      const r = this.db.prepare('SELECT user_idx, token_hash, ident_enc FROM registrations LIMIT 1').get() as
+        | Pick<Row, 'user_idx' | 'token_hash' | 'ident_enc'>
+        | undefined;
+      if (r) {
+        try {
+          this.openIdent(r);
+        } catch {
+          fail();
+        }
+      }
+    }
+  }
+
+  /**
+   * After the migration: rewrite the file and truncate the WAL so the old
+   * plaintext pages don't linger. Tracked by a persistent flag, so an
+   * interrupted or busy cleanup is retried at the next start.
+   */
+  private cleanup(): void {
+    try {
+      this.db.exec('VACUUM');
+      const r = this.db.pragma('wal_checkpoint(TRUNCATE)') as { busy: number }[];
+      if (r[0] && r[0].busy !== 0) {
+        log.warn('post-migration WAL truncate was busy; will retry at next start');
+        return;
+      }
+      this.db.prepare(`DELETE FROM meta WHERE k = 'cleanup_pending'`).run();
+    } catch (e) {
+      log.error('post-migration cleanup failed; will retry at next start', { err: errCode(e) });
+    }
   }
 
   private columns(table: string): string[] {
@@ -181,7 +260,8 @@ export class Store {
    * v1 -> v2: replace plaintext pubkeys, relays and NWC keys with the HMAC
    * index + encrypted identity blob, re-key watermarks by the index, and hash
    * notified event ids. One transaction; then VACUUM + WAL truncate so the
-   * plaintext pages don't linger in the file (secure_delete zeroes freed pages).
+   * plaintext pages don't linger in the file (secure_delete zeroes freed pages;
+   * the cleanup runs from the constructor and is retried until it succeeds).
    * Device tokens were already encrypted, with associated data that still
    * matches, so they are carried over as is.
    */
@@ -237,10 +317,9 @@ export class Store {
         this.db.exec(`DROP TABLE notified_events_v1`);
       }
       this.db.prepare(`INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_version', ?)`).run(SCHEMA_VERSION);
+      this.db.prepare(`INSERT OR REPLACE INTO meta (k, v) VALUES ('cleanup_pending', 1)`).run();
     });
     tx();
-    this.db.exec('VACUUM');
-    this.db.pragma('wal_checkpoint(TRUNCATE)');
     log.info('database migrated: identity columns encrypted', { schema: SCHEMA_VERSION, registrations: regs });
   }
 
@@ -416,22 +495,22 @@ export class Store {
     );
   }
 
-  private newUserBudgetOk(nowSec: number): boolean {
-    const max = this.limits.maxNewUsersPerHour;
+  private newRegBudgetOk(nowSec: number): boolean {
+    const max = this.limits.maxNewRegistrationsPerHour;
     if (max === 0) return true;
     const hour = Math.floor(nowSec / HOUR);
-    if (this.newUsers.hour !== hour) this.newUsers = { hour, used: 0 };
-    return this.newUsers.used < max;
+    if (this.newRegs.hour !== hour) this.newRegs = { hour, used: 0 };
+    return this.newRegs.used < max;
   }
 
   /**
-   * Take one provider token check from the hourly budget (4x the new-user
-   * budget; unlimited if that is). Refused requests don't consume the new-user
-   * budget, so without this, fresh keys with made-up tokens could trigger
-   * unbounded provider requests and stall the (sequential) registration inbox.
+   * Take one provider token check from the hourly budget (4x the new
+   * registration budget; unlimited if that is). Refused requests don't consume
+   * the registration budget, so without this, fresh keys with made-up tokens
+   * could trigger unbounded provider requests.
    */
   takeTokenCheck(nowSec: number): boolean {
-    const max = this.limits.maxNewUsersPerHour * 4;
+    const max = this.limits.maxNewRegistrationsPerHour * 4;
     if (max === 0) return true;
     const hour = Math.floor(nowSec / HOUR);
     if (this.tokenChecks.hour !== hour) this.tokenChecks = { hour, used: 0 };
@@ -450,7 +529,14 @@ export class Store {
     req: RegistrationRequest,
     validated: boolean,
     nowSec: number,
-  ): { ownVictims: { token_hash: string; ts: number }[]; capVictim: { user_idx: string; token_hash: string; ts: number } | null } | 'limit' {
+    tokenHash: string,
+  ):
+    | {
+        ownVictims: { token_hash: string; ts: number }[];
+        tokenVictims: { user_idx: string; ts: number }[];
+        capVictim: { user_idx: string; token_hash: string; ts: number } | null;
+      }
+    | 'limit' {
     // Per-user device cap: evict the least recently refreshed — keeping its
     // full ts as the watermark. An incoming device not newer than the one it
     // would evict is refused instead (ordering is never lowered).
@@ -460,10 +546,19 @@ export class Store {
     const excess = devices.length - this.limits.maxDevicesPerUser + 1;
     const ownVictims = excess > 0 ? devices.slice(0, excess) : [];
     if (ownVictims.some((v) => v.ts >= req.ts)) return 'limit';
-    // A burst of fresh keys can only claim maxNewUsersPerHour slots per hour.
-    if (devices.length === 0 && !this.newUserBudgetOk(nowSec)) return 'limit';
+    // One device token can be registered by at most maxUsersPerToken users
+    // (several accounts on one device); past that, the least recently
+    // refreshed of them is replaced. So one real device can't be multiplied
+    // across fresh keys to fill the cap.
+    const holders = this.db
+      .prepare('SELECT user_idx, ts FROM registrations WHERE token_hash = ? AND user_idx != ? ORDER BY updated_at ASC')
+      .all(tokenHash, idx) as { user_idx: string; ts: number }[];
+    const tokenExcess = holders.length - this.limits.maxUsersPerToken + 1;
+    const tokenVictims = tokenExcess > 0 ? holders.slice(0, tokenExcess) : [];
+    // Anyone can only claim maxNewRegistrationsPerHour slots per hour.
+    if (!this.newRegBudgetOk(nowSec)) return 'limit';
     let capVictim = null;
-    if (ownVictims.length === 0 && this.countActive() >= this.limits.maxRegistrations) {
+    if (ownVictims.length === 0 && tokenVictims.length === 0 && this.countActive() >= this.limits.maxRegistrations) {
       // Full: only a validated newcomer may displace the oldest provisional
       // (never-validated, never-delivered) registration. Validated ones stay.
       if (!validated) return 'limit';
@@ -473,7 +568,7 @@ export class Store {
           .get() as { user_idx: string; token_hash: string; ts: number } | undefined) ?? null;
       if (!capVictim) return 'limit';
     }
-    return { ownVictims, capVictim };
+    return { ownVictims, tokenVictims, capVictim };
   }
 
   /**
@@ -482,7 +577,7 @@ export class Store {
    * with a valid token.
    */
   wouldAdmit(req: RegistrationRequest, nowSec: number): boolean {
-    return this.admission(this.uidx(req.user), req, true, nowSec) !== 'limit';
+    return this.admission(this.uidx(req.user), req, true, nowSec, this.tokenHash(req.platform, req.app, req.token)) !== 'limit';
   }
 
   /**
@@ -523,8 +618,7 @@ export class Store {
           this.raiseWatermark(idx, req.ts);
           return 'limit';
         }
-        const isNewUser = !this.hasLive(idx);
-        const adm = this.admission(idx, req, validation === 'ok', nowSec);
+        const adm = this.admission(idx, req, validation === 'ok', nowSec, tokenHash);
         if (adm === 'limit') {
           this.raiseWatermark(idx, req.ts);
           return 'limit';
@@ -533,8 +627,9 @@ export class Store {
           this.raiseWatermark(idx, v.ts);
           this.deleteRow(idx, v.token_hash);
         }
+        for (const v of adm.tokenVictims) this.removeVersion(v.user_idx, tokenHash, v.ts);
         if (adm.capVictim) this.removeVersion(adm.capVictim.user_idx, adm.capVictim.token_hash, adm.capVictim.ts);
-        if (isNewUser && this.limits.maxNewUsersPerHour > 0) this.newUsers.used++;
+        if (this.limits.maxNewRegistrationsPerHour > 0) this.newRegs.used++;
       }
 
       const enc = this.crypto.encrypt(req.token, this.tokenAad(req.user, tokenHash, req.app, req.platform));

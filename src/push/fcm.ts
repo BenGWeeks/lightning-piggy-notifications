@@ -1,7 +1,7 @@
 // FCM HTTP v1 with OAuth2 service-account auth (JWT bearer grant).
 
 import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
-import { errCode, log } from '../log.js';
+import { errCode, warnThrottled } from '../log.js';
 import type { Device } from '../store.js';
 import {
   ALERT_TITLE,
@@ -109,7 +109,7 @@ export class FcmSender implements PushSender {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
-      log.warn('fcm transport error', { err: errCode(e) });
+      warnThrottled(`fcm transport ${errCode(e)}`, 'fcm transport error', { err: errCode(e) });
       return { retry: true };
     }
     // Always consume the body so the connection is released promptly.
@@ -125,7 +125,7 @@ export class FcmSender implements PushSender {
     // Quota: the notifier backs off from 60 s (FCM guidance) and never earlier than Retry-After.
     if (res.status === 429 || code === 'QUOTA_EXCEEDED') return { retry: true, quota: true, afterMs: after };
     if (res.status >= 500 || code === 'UNAVAILABLE' || code === 'INTERNAL') return { retry: true, afterMs: after };
-    log.warn('fcm rejected push', { status: res.status, code: code.slice(0, 40), app: device.app });
+    warnThrottled(`fcm push ${res.status} ${code.slice(0, 40)} ${device.app}`, 'fcm rejected push', { status: res.status, code: code.slice(0, 40), app: device.app });
     return 'error';
   }
 
@@ -144,7 +144,7 @@ export class FcmSender implements PushSender {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
-      log.warn('fcm transport error', { err: errCode(e) });
+      warnThrottled(`fcm transport ${errCode(e)}`, 'fcm transport error', { err: errCode(e) });
       return 'unavailable';
     }
     const body = await res.text().catch(() => '');
@@ -155,7 +155,9 @@ export class FcmSender implements PushSender {
       return this.validate(t, true);
     }
     if (isInvalidToken(res.status, code, message)) return 'invalid';
-    if (res.status !== 429 && res.status < 500) log.warn('fcm rejected token check', { status: res.status, code: code.slice(0, 40), app: t.app });
+    if (res.status !== 429 && res.status < 500) {
+      warnThrottled(`fcm check ${res.status} ${code.slice(0, 40)} ${t.app}`, 'fcm rejected token check', { status: res.status, code: code.slice(0, 40), app: t.app });
+    }
     return 'unavailable';
   }
 }

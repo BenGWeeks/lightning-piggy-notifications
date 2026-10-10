@@ -4,7 +4,7 @@
 
 import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
 import http2 from 'node:http2';
-import { errCode, log } from '../log.js';
+import { errCode, log, warnThrottled } from '../log.js';
 import type { Device } from '../store.js';
 import {
   ALERT_TITLE,
@@ -93,7 +93,7 @@ export class ApnsSender implements PushSender {
     try {
       res = await this.transport(req.origin, req.path, req.headers, req.body);
     } catch (e) {
-      log.warn('apns transport error', { err: errCode(e) });
+      warnThrottled(`apns transport ${errCode(e)}`, 'apns transport error', { err: errCode(e) });
       return { retry: true };
     }
     if (res.status === 200) return 'ok';
@@ -105,7 +105,11 @@ export class ApnsSender implements PushSender {
     }
     if (res.status === 429) return { retry: true, quota: true };
     if (res.status >= 500) return { retry: true };
-    log.warn('apns rejected push', { status: res.status, reason: reason.slice(0, 40), app: device.app });
+    warnThrottled(`apns push ${res.status} ${reason.slice(0, 40)} ${device.app}`, 'apns rejected push', {
+      status: res.status,
+      reason: reason.slice(0, 40),
+      app: device.app,
+    });
     return 'error';
   }
 
@@ -129,7 +133,7 @@ export class ApnsSender implements PushSender {
     try {
       res = await this.transport(origin, `/3/device/${t.token}`, headers, JSON.stringify({ aps: { 'content-available': 1 }, ...VALIDATION_DATA }));
     } catch (e) {
-      log.warn('apns transport error', { err: errCode(e) });
+      warnThrottled(`apns transport ${errCode(e)}`, 'apns transport error', { err: errCode(e) });
       return 'unavailable';
     }
     if (res.status === 200) return 'ok';
@@ -139,7 +143,13 @@ export class ApnsSender implements PushSender {
       this.providerToken(true);
       return this.validate(t, true);
     }
-    if (res.status !== 429 && res.status < 500) log.warn('apns rejected token check', { status: res.status, reason: reason.slice(0, 40), app: t.app });
+    if (res.status !== 429 && res.status < 500) {
+      warnThrottled(`apns check ${res.status} ${reason.slice(0, 40)} ${t.app}`, 'apns rejected token check', {
+        status: res.status,
+        reason: reason.slice(0, 40),
+        app: t.app,
+      });
+    }
     return 'unavailable';
   }
 }

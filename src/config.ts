@@ -9,10 +9,13 @@ export interface Limits {
   maxDevicesPerUser: number;
   maxRegistrations: number;
   /**
-   * Users without a live registration admitted per hour (0 = unlimited). A
-   * burst of fresh keys can't fill the registration cap faster than this.
+   * New devices (registrations) admitted per hour, across all users (0 =
+   * unlimited). Nostr keys are free, so this bounds how fast anyone can fill
+   * the registration cap. Provider token checks are budgeted at 4x this.
    */
-  maxNewUsersPerHour: number;
+  maxNewRegistrationsPerHour: number;
+  /** Users that may register the same device token (several accounts on one device). */
+  maxUsersPerToken: number;
   /** Users with a replay watermark (bounded; when full the watcher fails closed). */
   maxWatermarkUsers: number;
   /** Max users that may claim one NWC client pubkey (routing fan-out bound). */
@@ -80,7 +83,8 @@ export const DEFAULT_LIMITS: Limits = {
   // maxSubsPerRelay REQs of at most reqMaxBytes each (a test asserts the worst
   // case: every registration with all categories and 3 NWC connections).
   maxRegistrations: 1_000,
-  maxNewUsersPerHour: 60,
+  maxNewRegistrationsPerHour: 60,
+  maxUsersPerToken: 5,
   maxWatermarkUsers: 100_000,
   maxOwnersPerNwcClient: 3,
   // Live events older than 10 min are never notified; gift wraps are only
@@ -185,7 +189,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   limits.devicePushesPerHour = intEnv(env, 'WATCHER_DEVICE_PUSHES_PER_HOUR', limits.devicePushesPerHour);
   limits.maxRegistrations = intEnv(env, 'WATCHER_MAX_REGISTRATIONS', limits.maxRegistrations);
   limits.maxDevicesPerUser = Math.max(1, intEnv(env, 'WATCHER_MAX_DEVICES_PER_USER', limits.maxDevicesPerUser));
-  limits.maxNewUsersPerHour = intEnv(env, 'WATCHER_NEW_USERS_PER_HOUR', limits.maxNewUsersPerHour);
+  limits.maxNewRegistrationsPerHour = intEnv(env, 'WATCHER_NEW_REGISTRATIONS_PER_HOUR', limits.maxNewRegistrationsPerHour);
+  limits.maxUsersPerToken = Math.max(1, intEnv(env, 'WATCHER_MAX_USERS_PER_TOKEN', limits.maxUsersPerToken));
   limits.maxUserRelays = intEnv(env, 'WATCHER_MAX_USER_RELAYS', limits.maxUserRelays);
 
   return {

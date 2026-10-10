@@ -53,7 +53,7 @@ weekly).
 | Watcher operator / anyone who compromises the running host (database + key) | Link a pubkey to a device token and app; see the timing of incoming events per category (by turning on debug logging or instrumenting the process); link NWC client keys and the wallet service to the user's identity; send generic pushes to registered devices | Read DMs, zap notes or wallet traffic; learn IP addresses; register or unregister someone else (the seal signature proves authorship) |
 | Someone who gets the database file only (a backup, a disk image) | See how many registrations and (pseudonymous) users there are, each row's app id, platform, APNs environment, category toggles and timestamps; how many devices each pseudonymous user has; how many events notified, per hour | Learn any pubkey, relay, NWC key or device token: those are AES-256-GCM encrypted or replaced by keyed HMACs, with the key held in a separate secret file |
 | Someone who gets the logs (at `info`) | See the watcher's own npub, relay connection health, and per-interval totals per category (events matched, pushes delivered/failed, registrations) | See any user, device or event identifier |
-| Relay operators | See that the watcher's IP subscribes to a set of pubkeys, which marks them as likely Lightning Piggy users with notifications on ("the watcher is watching your key"). On relays a user listed, see the NWC client keys of that user's connections; when few users list that relay, the client key is linkable to them | See who registered (gift wraps use throwaway keys) or what was registered; see which categories a user turned on (every watched user gets the same filters) |
+| Relay operators | See that the watcher's IP subscribes to a set of pubkeys, which marks them as likely Lightning Piggy users with notifications on ("the watcher is watching your key"). On relays a user listed, see the NWC client keys of that user's registered connections; when few users list that relay, the client key is linkable to them | See who registered (gift wraps use throwaway keys) or what was registered; see which categories a user turned on (every watched user gets the same filters, and NWC filters don't depend on the payment toggle) |
 | Apple / Google | See delivery, timing, category and coalesced count of generic alerts, and one silent token check per newly registered device | See content, senders or Nostr kinds |
 | Other Nostr users | Trigger a push by mentioning or zapping you. This is rate-limited: at most one push per category per 30 s window, and a per-device token bucket (bursts up to 60, refilling at 60 per hour). | Register your devices, change your settings, learn your token, claim your NWC connection (that needs a proof signed by the connection secret), or fake a payment push (it must come from your registered wallet) |
 | Replay attacker (re-broadcasts old gift wraps) | Nothing | Roll back or resurrect a registration (newest-wins per device, per-user replay watermarks, 6-hour timestamp window), or use up your registration allowance (stale requests are rejected before rate-limiting) |
@@ -92,7 +92,9 @@ Known limits:
   turned on. The router then drops events for categories a user didn't enable,
   so relays can't infer per-user category settings. NWC filters (kinds
   23196/23197 by client key) are sent only to the relays that user listed
-  (their wallet's relay), not to every default relay.
+  (their wallet's relay), not to every default relay. They are sent whenever
+  the registration lists NWC connections, whether or not payment pushes are on,
+  so they don't reveal that toggle either.
   Regular kinds use `since = now − 120 s`. Gift-wrap filters don't use `since`
   at all, because NIP-59 back-dates `created_at` by up to 48 h: they use
   `limit: 1`, and only events that arrive after EOSE count as new. Event ids are
@@ -145,9 +147,14 @@ key file) derives separate HKDF subkeys for each use:
 Plaintext columns: app id, platform, APNs environment, category bitmask, and
 timestamps (registration `ts`, last refresh, validation). Deletes use
 `secure_delete`. A database from an older version (plaintext pubkeys, relays
-and NWC keys) is migrated in place on first start, in one transaction, followed
-by `VACUUM` and a WAL truncate; back it up first, and delete the backup once the
+and NWC keys) is migrated in place on first start, in one transaction. A
+`VACUUM` and a WAL truncate follow, and they are retried at every start until
+they complete. Back the database up first, and delete the backup once the
 upgrade is verified, because the backup still holds the plaintext.
+
+The database stores a keyed check value. If the token key file doesn't match
+the database (a mistake in the configuration), the watcher refuses to start and
+changes nothing, rather than dropping every registration as unreadable.
 
 **If only the database file leaks**, it reveals counts, app ids, platforms,
 category toggles, timestamps and how rows group by (pseudonymous) user. **With
@@ -176,18 +183,24 @@ the cap is protected by several layers:
    that platform isn't configured), the device is admitted **provisionally**.
    The first push the provider accepts validates it. Refreshes of an existing
    device aren't re-checked, and no check is made for a request that would be
-   refused anyway. Checks are budgeted at 4 × `WATCHER_NEW_USERS_PER_HOUR` per
-   hour, so made-up tokens from fresh keys can't cause unbounded provider
-   requests; past the budget, new devices are refused until the next hour.
-2. **Per-user share.** One key holds at most `WATCHER_MAX_DEVICES_PER_USER`
-   devices (default 10, 1% of the cap). An 11th replaces that key's least
-   recently refreshed device.
-3. **New-user budget.** At most `WATCHER_NEW_USERS_PER_HOUR` keys without a
-   live registration are admitted per hour (default 60). A burst of fresh keys
-   can't fill the cap faster than that, which gives the operator time to see
-   it (`limit` in the activity log, `/ready`) and react. Existing users are
-   never affected. During such a burst, a genuinely new user may be refused
-   until the app's next refresh.
+   refused anyway. Checks run on a few background workers, so a slow provider
+   never holds up other registrations (refreshes, unregisters). They are
+   budgeted at 4 × `WATCHER_NEW_REGISTRATIONS_PER_HOUR` per hour, so made-up
+   tokens from fresh keys can't cause unbounded provider requests. Past the
+   budget, or with too many checks waiting, new devices are refused until the
+   app's next refresh.
+2. **Per-user and per-device shares.** One key holds at most
+   `WATCHER_MAX_DEVICES_PER_USER` devices (default 10, 1% of the cap). An 11th
+   replaces that key's least recently refreshed device. One device token can
+   be registered by at most `WATCHER_MAX_USERS_PER_TOKEN` keys (default 5, for
+   several accounts on one phone). Past that, the least recently refreshed of
+   them is replaced, so one real device can't be multiplied across fresh keys.
+3. **New-registration budget.** At most `WATCHER_NEW_REGISTRATIONS_PER_HOUR`
+   new devices are admitted per hour across all keys (default 60). Refreshes
+   don't count. Nobody can fill the cap faster than that, which gives the
+   operator time to see it (`limit` in the activity log, `/ready`) and react.
+   Existing registrations are never affected, but during such a burst a
+   genuinely new device may be refused until the app's next refresh.
 4. **Eviction at capacity.** When the table is full, a newcomer with a
    validated token evicts the least recently refreshed **provisional**
    registration. Validated registrations are never evicted to make room. If
@@ -217,7 +230,10 @@ user, device or event identifiers, not even truncated ones. They hold:
 
 - the watcher's own npub and relay health (user-supplied relays appear as
   opaque hashes);
-- warnings and errors, with error codes but never raw network error messages;
+- warnings and errors, with error codes but never raw network error messages.
+  Provider-side warnings that can recur on every delivery (rejections,
+  transport errors) are throttled to one line per kind per 5 minutes, with a
+  count of how many were suppressed;
 - an `activity` line every `WATCHER_ACTIVITY_LOG_SECONDS` (default 300; quiet
   intervals log nothing) with totals per category: events matched, pushes
   delivered, failed, retried, dropped, rate-limited and invalid tokens, plus
@@ -248,7 +264,8 @@ them at 3 × 10 MB.
 | `WATCHER_DEVICE_PUSHES_PER_HOUR` | `60` | |
 | `WATCHER_MAX_REGISTRATIONS` | `1000` | The admission cap. It is sized so the default relays can always carry every registration (worst case: all categories plus 3 NWC connections) within 15 REQs of at most 60 KB each. Raise it only together with the planner limits. If the plan ever overflows, `/ready` reports `plan_overflow`. |
 | `WATCHER_MAX_DEVICES_PER_USER` | `10` | Per-key share of the cap. See [Capacity and admission](#capacity-and-admission). |
-| `WATCHER_NEW_USERS_PER_HOUR` | `60` | Keys without a live registration admitted per hour. `0` means unlimited. |
+| `WATCHER_MAX_USERS_PER_TOKEN` | `5` | Keys that may register the same device token. |
+| `WATCHER_NEW_REGISTRATIONS_PER_HOUR` | `60` | New devices admitted per hour, across all keys. `0` means unlimited. Token checks are budgeted at 4× this. |
 | `WATCHER_MAX_USER_RELAYS` | `40` | |
 | `WATCHER_ACTIVITY_LOG_SECONDS` | `300` | Interval of the aggregate `activity` log line. `0` turns it off. |
 | `LOG_LEVEL` | `info` | `info` logs no user, device or event identifiers. See [Logging](#logging). |

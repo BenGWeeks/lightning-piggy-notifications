@@ -14,7 +14,7 @@
 //   aggregate; per-delivery lines are debug-only, with per-process pseudonyms.
 
 import type { Activity } from './activity.js';
-import { errCode, log, logs, pseudonym } from './log.js';
+import { errCode, log, logs, pseudonym, warnThrottled } from './log.js';
 import type { Category } from './registration.js';
 import type { Device, Store } from './store.js';
 import { isRetry, type PushNotification, type PushResult, type PushSender } from './push/types.js';
@@ -163,7 +163,7 @@ export class Notifier {
     const { device: d, n } = job;
     const sender = d.platform === 'apns' ? this.deps.senders.apns : this.deps.senders.fcm;
     if (!sender) {
-      log.warn('no sender configured for platform', { platform: d.platform });
+      warnThrottled(`no sender ${d.platform}`, 'no sender configured for platform', { platform: d.platform });
       return;
     }
     if (this.now() > job.expiresAt) {
@@ -196,12 +196,15 @@ export class Notifier {
     try {
       result = await sender.send(d, n, stillValid);
     } catch (e) {
-      log.warn('push send threw', { err: errCode(e) });
+      warnThrottled(`send threw ${errCode(e)}`, 'push send threw', { err: errCode(e) });
       result = { retry: true };
     }
-    // No user/device identifiers at info+: per-delivery detail is debug-only.
-    const fields = { category: n.category, platform: d.platform, app: d.app, attempt: job.attempt };
-    const detail = () => (logs('debug') ? { ...fields, count: n.count, user: pseudonym(d.user), device: pseudonym(d.tokenHash) } : {});
+    // Per-delivery lines (even without identifiers, their timing is a
+    // delivery timeline) are debug-only; info gets the aggregate counters.
+    const detail = () =>
+      logs('debug')
+        ? { category: n.category, platform: d.platform, app: d.app, attempt: job.attempt, count: n.count, user: pseudonym(d.user), device: pseudonym(d.tokenHash) }
+        : {};
     const activity = this.deps.activity;
     if (result === 'cancelled') {
       this.stats.dropped++;
@@ -250,7 +253,7 @@ export class Notifier {
     } else {
       this.stats.failed++;
       activity?.count('failed', n.category);
-      log.warn('push failed', fields);
+      log.debug('push failed', detail());
     }
   }
 

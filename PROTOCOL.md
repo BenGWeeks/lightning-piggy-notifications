@@ -58,7 +58,7 @@ someone else.
 | `app` | The app id. It is also the APNs topic, so it must be the iOS bundle id / Android package. The watcher only accepts ids it is configured for. |
 | `apns_env` | Optional, iOS only: `production` (the default) or `sandbox`. This is the APNs environment the token was issued for. It follows the build's signing (`aps-environment` entitlement), not its bundle id. The iOS Simulator and development-signed (Xcode / `expo run:ios`) builds get `sandbox`. App Store, TestFlight and ad hoc builds get `production`, and that includes EAS `distribution: internal` builds of the dev client. Read it with `expo-application`'s `getIosPushNotificationServiceEnvironmentAsync()`, where `'development'` means `sandbox`. If the field is omitted, the operator's `WATCHER_APNS_SANDBOX_APPS` fallback applies (empty by default). |
 | `categories` | Missing keys mean `false`. `dm` covers NIP-04 (kind 4) and NIP-17 (kind 1059). `zap` covers kind 9735. `mention` covers kind 1 with a `p` tag. `payment` covers NWC notifications (kinds 23196/23197). |
-| `relays` | `wss://` only. Hostnames only: no IP literals, `localhost`, `.local` or similar. No credentials or query string. URLs are normalised and de-duplicated, and anything invalid is dropped. At most 8 are kept (sending more than 16 is rejected). Include the user's DM inbox relays (kind 10050), their read relays (kind 10002), **and the NWC wallet relay** if `payment` is on. The watcher always watches its own default relays for DMs, zaps and mentions as well, but sends NWC filters **only** to relays listed here (so the client keys aren't exposed to every default relay): without the wallet relay, payment pushes won't fire. |
+| `relays` | `wss://` only. Hostnames only: no IP literals, `localhost`, `.local` or similar. No credentials or query string. URLs are normalised and de-duplicated, and anything invalid is dropped. At most 8 are kept (sending more than 16 is rejected). Include the user's DM inbox relays (kind 10050), their read relays (kind 10002), **and the NWC wallet relay** if `payment` is on. The watcher always watches its own default relays for DMs, zaps and mentions as well, but sends NWC filters **only** to relays listed here (so the client keys aren't exposed to every default relay): without the wallet relay, payment pushes won't fire. NWC filters are sent whenever `nwc` is non-empty, whatever `categories.payment` says (so relays can't see that toggle); to stop watching a connection at all, omit it from `nwc`. |
 | `nwc` | 0–3 entries, one per NWC connection. `client` is the pubkey of the connection's `secret` (the `p` tag on the wallet's notifications). `wallet` is the wallet service pubkey (the `nostr+walletconnect://<wallet>` part, and the author of the notifications). `proof` (128 hex chars) is a BIP-340 Schnorr signature **by the client secret** over `sha256("lightning-piggy-watcher/nwc/v1:" + <user pubkey hex> + ":" + <wallet pubkey hex>)`. The proof means only someone holding the connection secret can claim its notifications. It is bound to the user, so it can't be reused by anyone else. A payment push only fires when a kind 23196/23197 event `p`-tags `client` **and** is authored by `wallet`. |
 | `ts` | Must equal the rumor's `created_at`. It must be no more than 6 hours in the past and no more than 2 minutes in the future. It must also **strictly increase** for each (user, token). |
 
@@ -114,8 +114,10 @@ that cap (details in the README, "Capacity and admission"):
   `content-available` and no alert). A token the provider rejects is refused.
   If the check can't be made, the device is admitted provisionally, until its
   first accepted push.
-- At most 60 **new users** (keys with no live registration) are admitted per
-  hour by default.
+- At most 60 **new devices** are admitted per hour across all keys by default
+  (refreshes don't count), and one device token can be registered by at most
+  5 keys (several accounts on one phone). Past that, the least recently
+  refreshed of them is replaced.
 - When full, a newcomer with a validated token replaces the least recently
   refreshed provisional registration; validated registrations are never
   replaced. Otherwise the newcomer is refused, and the app retries on its next

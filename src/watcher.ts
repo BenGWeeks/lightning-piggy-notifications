@@ -7,7 +7,7 @@ import { finalizeEvent, getPublicKey, verifyEvent, type EventTemplate, type Nost
 import { Activity } from './activity.js';
 import type { Config } from './config.js';
 import { startHealthServer } from './health.js';
-import { errCode, log, logs, pseudonym } from './log.js';
+import { errCode, log, logs, pseudonym, warnThrottled } from './log.js';
 import { Notifier } from './notifier.js';
 import { buildPlan, LIVE_SINCE_SLACK_SEC, planOverflow } from './plan.js';
 import { ApnsSender } from './push/apns.js';
@@ -62,6 +62,9 @@ export function isWellFormedEvent(ev: unknown): ev is NostrEvent {
   return true;
 }
 const SWEEP_INTERVAL_MS = 60 * 60_000;
+/** Concurrent provider token checks, and new devices allowed to wait for one. */
+const CHECK_CONCURRENCY = 4;
+const CHECK_QUEUE_MAX = 64;
 
 export interface WatcherDeps {
   senders?: { apns?: PushSender; fcm?: PushSender };
@@ -83,6 +86,11 @@ export class Watcher {
   private inboxBytes = 0;
   private planOverflow = 0;
   private inboxDraining = false;
+  /** New devices waiting for a provider token check (bounded), and checks in flight. */
+  private readonly checkQueue: RegistrationRequest[] = [];
+  private checksRunning = 0;
+  private checkIdleWaiters: (() => void)[] = [];
+  private stopping = false;
   private regRate = new Map<string, { start: number; count: number }>();
   private rebuildTimer: NodeJS.Timeout | null = null;
   private sweepTimer: NodeJS.Timeout | null = null;
@@ -143,6 +151,17 @@ export class Watcher {
   }
 
   async stop(): Promise<void> {
+    // Stop taking registrations, and let token checks in flight finish (their
+    // results are discarded; unprocessed wraps are re-read from the relays'
+    // inbox history at the next start) before the store closes.
+    this.stopping = true;
+    this.checkQueue.length = 0;
+    if (this.checksRunning > 0) {
+      await Promise.race([
+        new Promise<void>((r) => this.checkIdleWaiters.push(r)),
+        new Promise<void>((r) => setTimeout(r, 20_000).unref()),
+      ]);
+    }
     if (this.rebuildTimer) clearTimeout(this.rebuildTimer);
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     if (this.activityTimer) clearInterval(this.activityTimer);
@@ -328,22 +347,50 @@ export class Watcher {
     }
   }
 
-  /** One registration at a time (each may await a token check), yielding between them. */
+  /** One registration per tick. Token checks run on their own bounded workers, so they never block this. */
   private drainInbox(): void {
     if (this.inboxDraining) return;
     this.inboxDraining = true;
     const step = () => {
-      const item = this.inbox.shift();
+      const item = this.stopping ? undefined : this.inbox.shift();
       if (!item) {
         this.inboxDraining = false;
         return;
       }
       this.inboxBytes -= item.bytes;
-      this.handleRegistration(item.ev)
-        .catch((e: unknown) => log.error('registration error', { err: errCode(e) }))
-        .finally(() => setImmediate(step));
+      this.handleRegistration(item.ev);
+      setImmediate(step);
     };
     setImmediate(step);
+  }
+
+  /**
+   * Token-check workers. Requests may be applied out of arrival order (a
+   * refresh or unregister doesn't wait for another device's check); that is
+   * safe because every apply re-checks newest-wins ordering itself.
+   */
+  private pumpChecks(): void {
+    while (!this.stopping && this.checksRunning < CHECK_CONCURRENCY && this.checkQueue.length > 0) {
+      const req = this.checkQueue.shift()!;
+      this.checksRunning++;
+      this.runCheck(req)
+        .catch((e: unknown) => log.error('registration error', { err: errCode(e) }))
+        .finally(() => {
+          this.checksRunning--;
+          if (this.checksRunning === 0) for (const w of this.checkIdleWaiters.splice(0)) w();
+          this.pumpChecks();
+        });
+    }
+  }
+
+  private async runCheck(req: RegistrationRequest): Promise<void> {
+    // The state may have changed while queued: re-decide before spending a request.
+    let validation: Validation | undefined;
+    if (this.store.isNewDevice(req) && this.store.wouldAdmit(req, now())) {
+      validation = this.store.takeTokenCheck(now()) ? await this.checkToken(req) : 'unchecked';
+    }
+    if (this.stopping) return;
+    this.finishRegistration(req, validation);
   }
 
   /**
@@ -362,12 +409,12 @@ export class Watcher {
         apnsEnv: req.apnsEnv ?? (this.cfg.apnsSandboxApps.includes(req.app) ? 'sandbox' : 'production'),
       });
     } catch (e) {
-      log.warn('token check failed', { err: errCode(e) });
+      warnThrottled(`token check ${errCode(e)}`, 'token check failed', { err: errCode(e) });
       return 'unavailable';
     }
   }
 
-  async handleRegistration(wrap: NostrEvent): Promise<void> {
+  handleRegistration(wrap: NostrEvent): void {
     let user = '';
     try {
       const { rumor, sealPubkey } = unwrapRegistration(wrap, this.cfg.secretKey);
@@ -384,10 +431,23 @@ export class Watcher {
       if (!this.regRateOk(user)) throw new RegistrationError('rate limited');
       // A new device's token is checked with its provider before it can take
       // a slot — unless it would be refused anyway (then no request is made).
-      let validation: Validation | undefined;
       if (this.store.isNewDevice(req) && this.store.wouldAdmit(req, now())) {
-        validation = this.store.takeTokenCheck(now()) ? await this.checkToken(req) : 'unchecked';
+        if (this.checkQueue.length >= CHECK_QUEUE_MAX) {
+          this.finishRegistration(req, 'unchecked'); // refused (settled); the app retries on its next refresh
+        } else {
+          this.checkQueue.push(req);
+          this.pumpChecks();
+        }
+        return;
       }
+      this.finishRegistration(req, undefined);
+    } catch (e) {
+      this.registrationRejected(e, user, wrap);
+    }
+  }
+
+  private finishRegistration(req: RegistrationRequest, validation: Validation | undefined): void {
+    try {
       const result = this.store.apply(req, now(), validation);
       this.stats.registrations++;
       this.activity.registration(result === 'invalid-token' ? 'invalid_token' : result);
@@ -410,12 +470,16 @@ export class Watcher {
       }
       if (result === 'registered' || result === 'updated' || result === 'unregistered') this.scheduleRebuild();
     } catch (e) {
-      this.stats.registrationRejects++;
-      this.activity.registration('rejected');
-      const reason = e instanceof RegistrationError ? e.reason : 'internal error';
-      log.debug('registration rejected', { reason, user: pseudonym(user), wrap: pseudonym(wrap.id) });
-      if (!(e instanceof RegistrationError)) log.error('registration error', { err: errCode(e) });
+      this.registrationRejected(e, req.user);
     }
+  }
+
+  private registrationRejected(e: unknown, user: string, wrap?: NostrEvent): void {
+    this.stats.registrationRejects++;
+    this.activity.registration('rejected');
+    const reason = e instanceof RegistrationError ? e.reason : 'internal error';
+    log.debug('registration rejected', { reason, user: pseudonym(user), wrap: pseudonym(wrap?.id) });
+    if (!(e instanceof RegistrationError)) log.error('registration error', { err: errCode(e) });
   }
 
   private regRateOk(user: string): boolean {

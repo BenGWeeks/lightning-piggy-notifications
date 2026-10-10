@@ -85,7 +85,7 @@ describe('buildPlan', () => {
     expect(flat(plan.get(DEFAULTS[0]!)!).filter((s) => s.mode !== 'inbox')).toEqual([]);
   });
 
-  it('sends NWC client keys only to relays the user listed, and only with payments on', () => {
+  it('sends NWC client keys only to relays the user listed, whatever the payment toggle', () => {
     const nwc = 'c'.repeat(64);
     const walletRelay = 'wss://wallet.example';
     const plan = buildPlan(
@@ -101,7 +101,9 @@ describe('buildPlan', () => {
     expect(nwcFilters(DEFAULTS[0]!)).toEqual([]);
     // ...but on the one they did, and on their own (wallet) relay.
     expect(nwcFilters(DEFAULTS[1]!).map((s) => s.filter)).toEqual([{ kinds: [23196, 23197], '#p': ['b'.repeat(64)] }]);
-    expect(nwcFilters(walletRelay).map((s) => s.filter)).toEqual([{ kinds: [23196, 23197], '#p': [nwc] }]);
+    // User 2 has payment pushes off but still lists the connection: the filter
+    // doesn't reveal the toggle (the router drops their payment events).
+    expect(nwcFilters(walletRelay).map((s) => s.filter)).toEqual([{ kinds: [23196, 23197], '#p': [nwc, 'd'.repeat(64)] }]);
   });
 
   it('subscription ids are stable for unchanged filters', () => {

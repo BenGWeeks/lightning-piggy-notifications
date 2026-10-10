@@ -18,7 +18,7 @@ const MAX_P_TAGS = 100;
 export class RouteIndex {
   /** user -> categories enabled on at least one device. */
   private readonly userCats = new Map<string, Set<Category>>();
-  /** NWC client pubkey -> (user, wallet) pairs with payments enabled; capped per client key. */
+  /** NWC client pubkey -> (user, wallet) pairs (payment toggle checked at match time); capped per client key. */
   private readonly nwcOwners = new Map<string, { user: string; wallet: string }[]>();
 
   constructor(regs: readonly RegistrationSummary[], maxOwnersPerNwcClient = 3) {
@@ -26,14 +26,12 @@ export class RouteIndex {
       const cats = this.userCats.get(r.user) ?? new Set<Category>();
       for (const [k, on] of Object.entries(r.categories)) if (on) cats.add(k as Category);
       this.userCats.set(r.user, cats);
-      if (r.categories.payment) {
-        for (const n of r.nwc) {
-          const owners = this.nwcOwners.get(n.client) ?? [];
-          if (owners.some((o) => o.user === r.user && o.wallet === n.wallet)) continue;
-          if (owners.length >= maxOwnersPerNwcClient) continue;
-          owners.push({ user: r.user, wallet: n.wallet });
-          this.nwcOwners.set(n.client, owners);
-        }
+      for (const n of r.nwc) {
+        const owners = this.nwcOwners.get(n.client) ?? [];
+        if (owners.some((o) => o.user === r.user && o.wallet === n.wallet)) continue;
+        if (owners.length >= maxOwnersPerNwcClient) continue;
+        owners.push({ user: r.user, wallet: n.wallet });
+        this.nwcOwners.set(n.client, owners);
       }
     }
   }

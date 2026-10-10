@@ -61,6 +61,26 @@ export const log = {
   error: (msg: string, f?: Record<string, unknown>) => emit('error', msg, f),
 };
 
+const throttled = new Map<string, { until: number; suppressed: number }>();
+
+/**
+ * A warning that can recur per delivery (provider rejections, transport
+ * errors): at most one line per `key` per window, carrying how many were
+ * suppressed since the last one — so provider health stays visible without
+ * the log becoming a per-delivery timeline.
+ */
+export function warnThrottled(key: string, msg: string, fields: Record<string, unknown> = {}, windowMs = 5 * 60_000): void {
+  const t = Date.now();
+  const e = throttled.get(key);
+  if (e && t < e.until) {
+    e.suppressed++;
+    return;
+  }
+  if (throttled.size > 1_000) throttled.clear();
+  throttled.set(key, { until: t + windowMs, suppressed: 0 });
+  emit('warn', msg, e?.suppressed ? { ...fields, suppressed: e.suppressed } : fields);
+}
+
 /** Log-safe error: its code (e.g. ECONNREFUSED) or class name, never a raw message. */
 export function errCode(e: unknown): string {
   const code = (e as NodeJS.ErrnoException | undefined)?.code;

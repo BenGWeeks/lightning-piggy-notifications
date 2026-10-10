@@ -10,7 +10,8 @@
 //   and the router drops what a user didn't enable. NWC client keys (which
 //   would otherwise be linkable to the user by filter grouping on every
 //   default relay) are only sent to relays that user listed, i.e. their
-//   wallet's relay.
+//   wallet's relay; they are sent whenever the registration lists NWC
+//   connections, whether or not payment pushes are on.
 // * #p values are chunked (<= limits.pTagChunk per filter).
 // * Chunks of the same mode are packed into multi-filter REQs (<=
 //   limits.filtersPerReq filters each), bounding subscriptions per relay.
@@ -140,7 +141,9 @@ const emptyWants = (): Wants => ({ users: new Set(), nwc: new Set() });
 function addWants(w: Wants, r: RegistrationSummary, withNwc: boolean): void {
   if (!Object.values(r.categories).some(Boolean)) return;
   w.users.add(r.user);
-  if (withNwc && r.categories.payment) for (const n of r.nwc) w.nwc.add(n.client);
+  // Independent of the payment toggle (the router applies it), so the filter
+  // doesn't change when the user turns payment pushes on or off.
+  if (withNwc) for (const n of r.nwc) w.nwc.add(n.client);
 }
 
 function specsFor(w: Wants, pTagChunk: number): FilterSpec[] {

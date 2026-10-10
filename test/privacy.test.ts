@@ -159,21 +159,34 @@ describe('admission: token validation, new-user budget, provisional eviction', (
     expect(s.devicesFor(getPublicKey(realSk))).toHaveLength(1);
   });
 
-  it('a burst of fresh keys is limited by the new-user budget; existing users are unaffected', () => {
-    const s = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewUsersPerHour: 3 });
+  it('new registrations are budgeted per hour (fresh keys and new devices alike); refreshes are not', () => {
+    const s = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewRegistrationsPerHour: 3 });
     const existing = generateSecretKey();
     s.apply(req(existing, regContent({ token: `${FCM_TOKEN}1` }, nowSec - 20)), nowSec, 'ok');
     let admitted = 0;
-    for (let i = 0; i < 10; i++) if (s.apply(req(generateSecretKey(), regContent({}, nowSec - 10)), nowSec, 'ok') === 'registered') admitted++;
+    for (let i = 0; i < 10; i++) {
+      if (s.apply(req(generateSecretKey(), regContent({ token: `${FCM_TOKEN}k${i}` }, nowSec - 10)), nowSec, 'ok') === 'registered') admitted++;
+    }
     expect(admitted).toBe(2);
-    // An existing user's extra device isn't a new user.
-    expect(s.apply(req(existing, regContent({ token: `${FCM_TOKEN}2` }, nowSec - 5)), nowSec, 'ok')).toBe('registered');
+    expect(s.apply(req(existing, regContent({ token: `${FCM_TOKEN}2` }, nowSec - 5)), nowSec, 'ok')).toBe('limit');
+    expect(s.apply(req(existing, regContent({ token: `${FCM_TOKEN}1` }, nowSec - 4)), nowSec, 'ok')).toBe('updated');
     // The budget refills next hour.
     expect(s.apply(req(generateSecretKey(), regContent({}, nowSec)), nowSec + 3600, 'ok')).toBe('registered');
   });
 
+  it('one device token is held by at most maxUsersPerToken users (least recently refreshed replaced)', () => {
+    const s = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxUsersPerToken: 2 });
+    const keys = [generateSecretKey(), generateSecretKey(), generateSecretKey(), generateSecretKey()];
+    for (const [i, sk] of keys.entries()) expect(s.apply(req(sk, regContent({}, nowSec - 10)), nowSec + i, 'ok')).toBe('registered');
+    expect(s.countActive()).toBe(2);
+    expect(s.devicesFor(getPublicKey(keys[0]!))).toEqual([]);
+    expect(s.devicesFor(getPublicKey(keys[3]!))).toHaveLength(1);
+    // The replaced registration's replay is stale.
+    expect(s.isStale(req(keys[0]!, regContent({}, nowSec - 10)))).toBe(true);
+  });
+
   it('bounds provider token checks per hour; a device that can\'t be checked is refused, not admitted unchecked', () => {
-    const s = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewUsersPerHour: 1 });
+    const s = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewRegistrationsPerHour: 1 });
     let taken = 0;
     for (let i = 0; i < 10; i++) if (s.takeTokenCheck(nowSec)) taken++;
     expect(taken).toBe(4);
@@ -182,7 +195,7 @@ describe('admission: token validation, new-user budget, provisional eviction', (
     expect(s.apply(r, nowSec, 'unchecked')).toBe('limit');
     expect(s.countActive()).toBe(0);
     expect(s.isStale(r)).toBe(true);
-    const unlimited = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewUsersPerHour: 0 });
+    const unlimited = new Store(':memory:', KEY, { ...DEFAULT_LIMITS, maxNewRegistrationsPerHour: 0 });
     for (let i = 0; i < 1000; i++) expect(unlimited.takeTokenCheck(nowSec)).toBe(true);
   });
 
@@ -331,11 +344,11 @@ describe('encryption at rest', () => {
     expect(s.devicesFor(user)[0]!.token).toBe(FCM_TOKEN);
     expect(s.isCurrent(user, s.devicesFor(user)[0]!.tokenHash, r.ts, 'dm')).toBe(true);
     s.close();
-    // The wrong key reads nothing (and drops the unusable rows).
-    const wrong = new Store(path, Buffer.alloc(32, 2), DEFAULT_LIMITS);
-    expect(wrong.listActive()).toEqual([]);
-    expect(wrong.countActive()).toBe(0);
-    wrong.close();
+    // The wrong key refuses to start, and changes nothing.
+    expect(() => new Store(path, Buffer.alloc(32, 2), DEFAULT_LIMITS)).toThrow(/token key does not match/);
+    const again = new Store(path, KEY, DEFAULT_LIMITS);
+    expect(again.countActive()).toBe(1);
+    again.close();
     rmSync(dir, { recursive: true });
   });
 
@@ -473,12 +486,182 @@ describe('admin tooling', () => {
       WATCHER_PRIVATE_KEY_FILE: k,
       WATCHER_TOKEN_KEY_FILE: t,
       WATCHER_MAX_DEVICES_PER_USER: '4',
-      WATCHER_NEW_USERS_PER_HOUR: '0',
+      WATCHER_NEW_REGISTRATIONS_PER_HOUR: '0',
+      WATCHER_MAX_USERS_PER_TOKEN: '3',
       WATCHER_ACTIVITY_LOG_SECONDS: '60',
     });
     expect(cfg.limits.maxDevicesPerUser).toBe(4);
-    expect(cfg.limits.maxNewUsersPerHour).toBe(0);
+    expect(cfg.limits.maxNewRegistrationsPerHour).toBe(0);
+    expect(cfg.limits.maxUsersPerToken).toBe(3);
     expect(cfg.activityLogSec).toBe(60);
     rmSync(dir, { recursive: true });
+  });
+});
+
+/** A minimal v1 (plaintext) database with one registration per user. */
+function writeV1(path: string, key: Buffer, users: string[]): void {
+  const crypto = new TokenCrypto(key);
+  const v1 = new Database(path);
+  v1.pragma('journal_mode = WAL');
+  v1.exec(`
+    CREATE TABLE registrations (user TEXT NOT NULL, token_hash TEXT NOT NULL, app TEXT NOT NULL, platform TEXT NOT NULL,
+      token_enc BLOB, categories INTEGER NOT NULL DEFAULT 0, relays TEXT NOT NULL DEFAULT '[]', nwc TEXT NOT NULL DEFAULT '[]',
+      ts INTEGER NOT NULL, updated_at INTEGER NOT NULL, apns_env TEXT, PRIMARY KEY (user, token_hash));
+    CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+    CREATE TABLE user_watermarks (user TEXT PRIMARY KEY, ts INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0);
+  `);
+  const app = 'com.lightningpiggy.app';
+  for (const [i, user] of users.entries()) {
+    const token = `${FCM_TOKEN}${i}`;
+    const th = crypto.tokenHash('fcm', app, token);
+    v1.prepare('INSERT INTO registrations VALUES (?, ?, ?, ?, ?, 15, ?, ?, ?, ?, NULL)').run(
+      user,
+      th,
+      app,
+      'fcm',
+      crypto.encrypt(token, `${user}|${th}|${app}|fcm`),
+      '[]',
+      '[]',
+      nowSec - 100,
+      nowSec - 100,
+    );
+  }
+  v1.close();
+}
+
+describe('review hardening', () => {
+  it('a v1 database opened with the wrong key is refused before migrating, and left untouched', () => {
+    const dir = tmp();
+    const path = join(dir, 'w.db');
+    const user = getPublicKey(generateSecretKey());
+    writeV1(path, KEY, [user]);
+    expect(() => new Store(path, Buffer.alloc(32, 2), DEFAULT_LIMITS)).toThrow(/token key does not match/);
+    const raw = new Database(path, { readonly: true });
+    expect((raw.prepare('SELECT COUNT(*) AS n FROM registrations WHERE user = ?').get(user) as { n: number }).n).toBe(1);
+    raw.close();
+    const s = new Store(path, KEY, DEFAULT_LIMITS);
+    expect(s.devicesFor(user)).toHaveLength(1);
+    s.close();
+    rmSync(dir, { recursive: true });
+  });
+
+  it('retries the post-migration cleanup at the next start until it completes', () => {
+    const dir = tmp();
+    const path = join(dir, 'w.db');
+    writeV1(path, KEY, [getPublicKey(generateSecretKey())]);
+    const s = new Store(path, KEY, DEFAULT_LIMITS);
+    const db = (s as unknown as { db: Database.Database }).db;
+    const pending = () => db.prepare(`SELECT v FROM meta WHERE k = 'cleanup_pending'`).get();
+    expect(pending()).toBeUndefined();
+    // Simulate an interrupted cleanup: the flag survives, and the next open finishes it.
+    db.prepare(`INSERT INTO meta (k, v) VALUES ('cleanup_pending', 1)`).run();
+    s.close();
+    const s2 = new Store(path, KEY, DEFAULT_LIMITS);
+    expect((s2 as unknown as { db: Database.Database }).db.prepare(`SELECT v FROM meta WHERE k = 'cleanup_pending'`).get()).toBeUndefined();
+    expect(s2.countActive()).toBe(1);
+    s2.close();
+    rmSync(dir, { recursive: true });
+  });
+
+  it('throttles recurring provider warnings and keeps per-delivery failures off info', async () => {
+    const lines: string[] = [];
+    setLogSink((l) => lines.push(l));
+    setLogLevel('info');
+    try {
+      const { warnThrottled } = await import('../src/log.js');
+      for (let i = 0; i < 5; i++) warnThrottled('k-test', 'provider says no', { status: 400 });
+      expect(lines.filter((l) => l.includes('provider says no'))).toHaveLength(1);
+      const { Notifier } = await import('../src/notifier.js');
+      const dev: Device = {
+        user: 'u'.repeat(64),
+        apnsEnv: 'production',
+        ts: 1,
+        tokenHash: 'h'.repeat(64),
+        app: 'com.lightningpiggy.app',
+        platform: 'fcm',
+        token: 't',
+        categories: { dm: true, zap: true, mention: true, payment: true },
+      };
+      const n = new Notifier({
+        store: { devicesFor: () => [dev], removeRegistration: () => false, isCurrent: () => true, markValidated: () => {} },
+        senders: { fcm: { send: async () => 'error' } },
+        coalesceWindowSec: 30,
+        devicePushesPerHour: 60,
+        onRegistrationsChanged: () => {},
+      });
+      n.notify(dev.user, 'dm');
+      await waitFor(() => n.stats.failed === 1);
+      expect(lines.some((l) => l.includes('push failed'))).toBe(false);
+      await n.drain(100);
+    } finally {
+      setLogSink((l) => process.stdout.write(l + '\n'));
+    }
+  });
+
+  describe('token checks never block the inbox; shutdown waits for them', () => {
+    let relay: MiniRelay;
+    let watcher: Watcher;
+    let release: () => void;
+    let started: number;
+
+    beforeEach(async () => {
+      relay = new MiniRelay();
+      await relay.start();
+      started = 0;
+      const gate = new Promise<void>((r) => (release = r));
+      const sender: PushSender = {
+        send: async () => 'ok',
+        validate: async () => {
+          started++;
+          await gate;
+          return 'ok';
+        },
+      };
+      watcher = new Watcher(testConfig({ secretKey: watcherSk, relays: [relay.url] }), { senders: { fcm: sender, apns: sender } });
+      await watcher.start();
+    });
+
+    afterEach(async () => {
+      release();
+      await relay.stop();
+    });
+
+    it('a refresh and an unregister are applied while another device waits for its check', async () => {
+      const a = generateSecretKey();
+      const b = generateSecretKey();
+      // A is registered before checks are slow... (store directly, provisional)
+      const store = watcher['store'] as Store;
+      store.apply(req(a, regContent({ token: `${FCM_TOKEN}a` }, nowSec - 30)), nowSec);
+      relay.publish(makeRegistrationWrap(b, watcher.pubkey, regContent({ token: `${FCM_TOKEN}b` }, nowSec - 20))); // waits on its check
+      await waitFor(() => started === 1);
+      relay.publish(makeRegistrationWrap(a, watcher.pubkey, regContent({ token: `${FCM_TOKEN}a`, action: 'unregister' }, nowSec - 10)));
+      await waitFor(() => watcher.readyStatus().registrations === 0);
+      release();
+      await waitFor(() => watcher.readyStatus().registrations === 1);
+      await watcher.stop();
+    });
+
+    it('stop() waits for checks in flight and discards their results', async () => {
+      relay.publish(makeRegistrationWrap(generateSecretKey(), watcher.pubkey, regContent({}, nowSec - 20)));
+      await waitFor(() => started === 1);
+      const stopped = watcher.stop();
+      setTimeout(() => release(), 50);
+      await expect(stopped).resolves.toBeUndefined(); // no use of the closed store
+    });
+  });
+});
+
+describe('routing applies the payment toggle (relay filters do not)', () => {
+  it('NWC events only match users with payment pushes on', async () => {
+    const { RouteIndex } = await import('../src/router.js');
+    const client = 'c'.repeat(64);
+    const wallet = 'e'.repeat(64);
+    const user = 'a'.repeat(64);
+    const base = { tokenHash: 't', app: 'com.lightningpiggy.app', platform: 'fcm' as const, relays: [], nwc: [{ client, wallet }] };
+    const ev = { id: 'x', pubkey: wallet, created_at: 1, kind: 23196, tags: [['p', client]], content: '', sig: '' };
+    const off = new RouteIndex([{ ...base, user, categories: { dm: true, zap: false, mention: false, payment: false } }]);
+    expect(off.route(ev)).toEqual([]);
+    const on = new RouteIndex([{ ...base, user, categories: { dm: false, zap: false, mention: false, payment: true } }]);
+    expect(on.route(ev)).toEqual([{ user, category: 'payment' }]);
   });
 });
