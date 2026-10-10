@@ -4,18 +4,25 @@
 import type http from 'node:http';
 import { npubEncode } from 'nostr-tools/nip19';
 import { finalizeEvent, getPublicKey, verifyEvent, type EventTemplate, type NostrEvent } from 'nostr-tools/pure';
+import { Activity } from './activity.js';
 import type { Config } from './config.js';
 import { startHealthServer } from './health.js';
-import { log, short } from './log.js';
+import { errCode, log, logs, pseudonym } from './log.js';
 import { Notifier } from './notifier.js';
 import { buildPlan, LIVE_SINCE_SLACK_SEC, planOverflow } from './plan.js';
 import { ApnsSender } from './push/apns.js';
 import { FcmSender } from './push/fcm.js';
 import type { PushSender } from './push/types.js';
-import { MAX_WRAP_CONTENT, parseRegistration, RegistrationError, unwrapRegistration } from './registration.js';
+import {
+  MAX_WRAP_CONTENT,
+  parseRegistration,
+  RegistrationError,
+  unwrapRegistration,
+  type RegistrationRequest,
+} from './registration.js';
 import { reasonCode, RelayPool, relayLabel, setPublicRelays, type RelayEventMeta } from './relay.js';
 import { RouteIndex, SeenCache } from './router.js';
-import { Store } from './store.js';
+import { Store, type Validation } from './store.js';
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const WATCHED_KINDS = new Set([1, 4, 1059, 9735, 23196, 23197]);
@@ -65,6 +72,8 @@ export class Watcher {
   private readonly store: Store;
   private readonly pool: RelayPool;
   readonly notifier: Notifier;
+  readonly activity = new Activity();
+  private readonly senders: { apns?: PushSender; fcm?: PushSender };
   private index = new RouteIndex([]);
   /** Ids processed live (or as registrations). */
   private readonly processed = new SeenCache();
@@ -77,6 +86,7 @@ export class Watcher {
   private regRate = new Map<string, { start: number; count: number }>();
   private rebuildTimer: NodeJS.Timeout | null = null;
   private sweepTimer: NodeJS.Timeout | null = null;
+  private activityTimer: NodeJS.Timeout | null = null;
   private health: http.Server | null = null;
   readonly stats = { events: 0, matched: 0, registrations: 0, registrationRejects: 0, inboxDropped: 0, rebuilds: 0 };
 
@@ -91,9 +101,11 @@ export class Watcher {
       apns: cfg.apns ? new ApnsSender(cfg.apns) : undefined,
       fcm: cfg.fcm ? new FcmSender(cfg.fcm) : undefined,
     };
+    this.senders = senders;
     this.notifier = new Notifier({
       store: this.store,
       senders,
+      activity: this.activity,
       coalesceWindowSec: cfg.limits.coalesceWindowSec,
       devicePushesPerHour: cfg.limits.devicePushesPerHour,
       concurrency: cfg.limits.pushConcurrency,
@@ -116,6 +128,10 @@ export class Watcher {
     this.health = await startHealthServer(this.cfg.healthHost, this.cfg.healthPort, () => this.readyStatus());
     this.sweepTimer = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
     this.sweepTimer.unref();
+    if (this.cfg.activityLogSec > 0) {
+      this.activityTimer = setInterval(() => this.activity.flush(), this.cfg.activityLogSec * 1000);
+      this.activityTimer.unref();
+    }
     log.info('watcher started', {
       npub: npubEncode(this.pubkey), // the watcher's own public identity
       relays: this.cfg.relays,
@@ -129,8 +145,10 @@ export class Watcher {
   async stop(): Promise<void> {
     if (this.rebuildTimer) clearTimeout(this.rebuildTimer);
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+    if (this.activityTimer) clearInterval(this.activityTimer);
     this.pool.close();
     await this.notifier.drain();
+    this.activity.flush();
     await new Promise<void>((r) => (this.health ? this.health.close(() => r()) : r()));
     this.store.close();
   }
@@ -138,9 +156,11 @@ export class Watcher {
   readyStatus(): { ready: boolean; [k: string]: unknown } {
     let db: boolean;
     let registrations = -1;
+    let provisional = -1;
     try {
       db = this.store.ping();
       registrations = this.store.countActive();
+      provisional = this.store.countProvisional();
     } catch {
       db = false;
     }
@@ -154,6 +174,7 @@ export class Watcher {
       relays_connected: this.pool.connectedCount(),
       relays_total: this.pool.conns.size,
       registrations,
+      registrations_provisional: provisional,
       apns_configured: !!this.cfg.apns,
       fcm_configured: !!this.cfg.fcm,
       stats: { ...this.stats, push: this.notifier.stats },
@@ -228,7 +249,8 @@ export class Watcher {
   private sweep(): void {
     try {
       const r = this.store.sweep(now());
-      if (r.expired) this.scheduleRebuild();
+      // Always re-plan: the admin CLI may have purged registrations meanwhile.
+      this.scheduleRebuild();
       log.info('sweep', r);
     } catch (e) {
       log.error('sweep failed', { err: e as Error });
@@ -300,11 +322,13 @@ export class Watcher {
     }
     for (const m of matches) {
       this.stats.matched++;
-      log.info('event matched', { kind: ev.kind, category: m.category, user: short(m.user), relay: relayLabel(meta.relay) });
-      this.notifier.notify(m.user, m.category, ev.kind);
+      this.activity.count('matched', m.category);
+      if (logs('debug')) log.debug('event matched', { kind: ev.kind, category: m.category, user: pseudonym(m.user), relay: relayLabel(meta.relay) });
+      this.notifier.notify(m.user, m.category);
     }
   }
 
+  /** One registration at a time (each may await a token check), yielding between them. */
   private drainInbox(): void {
     if (this.inboxDraining) return;
     this.inboxDraining = true;
@@ -315,13 +339,35 @@ export class Watcher {
         return;
       }
       this.inboxBytes -= item.bytes;
-      this.handleRegistration(item.ev);
-      setImmediate(step);
+      this.handleRegistration(item.ev)
+        .catch((e: unknown) => log.error('registration error', { err: errCode(e) }))
+        .finally(() => setImmediate(step));
     };
     setImmediate(step);
   }
 
-  handleRegistration(wrap: NostrEvent): void {
+  /**
+   * Admission check of a new device's token with its push provider (nothing is
+   * shown to the user). Without a sender for the platform, or if the provider
+   * can't answer, the device is admitted provisionally.
+   */
+  private async checkToken(req: RegistrationRequest): Promise<Validation> {
+    const sender = req.platform === 'apns' ? this.senders.apns : this.senders.fcm;
+    if (!sender?.validate) return 'unavailable';
+    try {
+      return await sender.validate({
+        token: req.token,
+        app: req.app,
+        platform: req.platform,
+        apnsEnv: req.apnsEnv ?? (this.cfg.apnsSandboxApps.includes(req.app) ? 'sandbox' : 'production'),
+      });
+    } catch (e) {
+      log.warn('token check failed', { err: errCode(e) });
+      return 'unavailable';
+    }
+  }
+
+  async handleRegistration(wrap: NostrEvent): Promise<void> {
     let user = '';
     try {
       const { rumor, sealPubkey } = unwrapRegistration(wrap, this.cfg.secretKey);
@@ -336,26 +382,39 @@ export class Watcher {
       // allowance (so re-broadcast old wraps can't block a fresh unregister).
       if (this.store.isStale(req)) throw new RegistrationError('stale');
       if (!this.regRateOk(user)) throw new RegistrationError('rate limited');
-      const result = this.store.apply(req, now());
+      // A new device's token is checked with its provider before it can take
+      // a slot — unless it would be refused anyway (then no request is made).
+      let validation: Validation | undefined;
+      if (this.store.isNewDevice(req) && this.store.wouldAdmit(req, now())) {
+        validation = this.store.takeTokenCheck(now()) ? await this.checkToken(req) : 'unchecked';
+      }
+      const result = this.store.apply(req, now(), validation);
       this.stats.registrations++;
-      log.info('registration', {
-        action: req.action,
-        result,
-        user: short(req.user),
-        app: req.app,
-        platform: req.platform,
-        categories: Object.entries(req.categories)
-          .filter(([, v]) => v)
-          .map(([k]) => k),
-        relays: req.relays.length,
-        nwc: req.nwc.length,
-      });
-      if (result !== 'stale' && result !== 'limit') this.scheduleRebuild();
+      this.activity.registration(result === 'invalid-token' ? 'invalid_token' : result);
+      // Per-user detail is debug-only (an info line per registration would be
+      // a per-user timeline, linkable to the stored timestamps).
+      if (logs('debug')) {
+        log.debug('registration', {
+          action: req.action,
+          result,
+          validation,
+          user: pseudonym(req.user),
+          app: req.app,
+          platform: req.platform,
+          categories: Object.entries(req.categories)
+            .filter(([, v]) => v)
+            .map(([k]) => k),
+          relays: req.relays.length,
+          nwc: req.nwc.length,
+        });
+      }
+      if (result === 'registered' || result === 'updated' || result === 'unregistered') this.scheduleRebuild();
     } catch (e) {
       this.stats.registrationRejects++;
+      this.activity.registration('rejected');
       const reason = e instanceof RegistrationError ? e.reason : 'internal error';
-      log.info('registration rejected', { reason, user: short(user), wrap: short(wrap.id) });
-      if (!(e instanceof RegistrationError)) log.error('registration error', { err: e as Error });
+      log.debug('registration rejected', { reason, user: pseudonym(user), wrap: pseudonym(wrap.id) });
+      if (!(e instanceof RegistrationError)) log.error('registration error', { err: errCode(e) });
     }
   }
 

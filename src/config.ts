@@ -8,11 +8,16 @@ export interface Limits {
   maxNwcPubkeysPerRegistration: number;
   maxDevicesPerUser: number;
   maxRegistrations: number;
+  /**
+   * Users without a live registration admitted per hour (0 = unlimited). A
+   * burst of fresh keys can't fill the registration cap faster than this.
+   */
+  maxNewUsersPerHour: number;
   /** Users with a replay watermark (bounded; when full the watcher fails closed). */
   maxWatermarkUsers: number;
   /** Max users that may claim one NWC client pubkey (routing fan-out bound). */
   maxOwnersPerNwcClient: number;
-  /** How long ids of events that triggered pushes are remembered (restart-safe dedupe). */
+  /** How long (keyed hashes of) ids of events that triggered pushes are remembered (restart-safe dedupe). */
   notifiedRetentionSec: number;
   notifiedMaxRows: number;
   notifiedInsertsPerMinute: number;
@@ -60,6 +65,8 @@ export interface Config {
   healthHost: string;
   healthPort: number;
   logLevel: string;
+  /** Interval of the aggregate `activity` log line (0 = off). */
+  activityLogSec: number;
   /** Tests only: allow ws:// and private/loopback relay hosts. */
   allowInsecureRelays: boolean;
   limits: Limits;
@@ -73,9 +80,13 @@ export const DEFAULT_LIMITS: Limits = {
   // maxSubsPerRelay REQs of at most reqMaxBytes each (a test asserts the worst
   // case: every registration with all categories and 3 NWC connections).
   maxRegistrations: 1_000,
+  maxNewUsersPerHour: 60,
   maxWatermarkUsers: 100_000,
   maxOwnersPerNwcClient: 3,
-  notifiedRetentionSec: 3 * 86400,
+  // Live events older than 10 min are never notified; gift wraps are only
+  // notified when streamed after EOSE. Two days covers re-broadcasts across a
+  // restart without keeping a longer activity trail.
+  notifiedRetentionSec: 2 * 86400,
   notifiedMaxRows: 100_000,
   notifiedInsertsPerMinute: 600,
   maxSubsPerRelay: 15,
@@ -88,7 +99,8 @@ export const DEFAULT_LIMITS: Limits = {
   pTagChunk: 400,
   registrationMaxAgeSec: 6 * 3600,
   registrationMaxSkewSec: 120,
-  registrationTtlDays: 60,
+  // The app re-registers when its last registration is over 7 days old.
+  registrationTtlDays: 30,
   registrationsPerUserPerHour: 30,
   inboxQueueMax: 1000,
   coalesceWindowSec: 30,
@@ -172,6 +184,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   limits.coalesceWindowSec = intEnv(env, 'WATCHER_COALESCE_SECONDS', limits.coalesceWindowSec);
   limits.devicePushesPerHour = intEnv(env, 'WATCHER_DEVICE_PUSHES_PER_HOUR', limits.devicePushesPerHour);
   limits.maxRegistrations = intEnv(env, 'WATCHER_MAX_REGISTRATIONS', limits.maxRegistrations);
+  limits.maxDevicesPerUser = Math.max(1, intEnv(env, 'WATCHER_MAX_DEVICES_PER_USER', limits.maxDevicesPerUser));
+  limits.maxNewUsersPerHour = intEnv(env, 'WATCHER_NEW_USERS_PER_HOUR', limits.maxNewUsersPerHour);
   limits.maxUserRelays = intEnv(env, 'WATCHER_MAX_USER_RELAYS', limits.maxUserRelays);
 
   return {
@@ -191,6 +205,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     healthHost: healthHost || '127.0.0.1',
     healthPort: Number(healthPortStr || 8080),
     logLevel: env.LOG_LEVEL || 'info',
+    activityLogSec: intEnv(env, 'WATCHER_ACTIVITY_LOG_SECONDS', 300),
     allowInsecureRelays: env.WATCHER_ALLOW_INSECURE_RELAYS === '1',
     limits,
   };

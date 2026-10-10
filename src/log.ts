@@ -1,11 +1,23 @@
-// Structured JSON logging. Privacy rule: never log device tokens, event
-// content, or full pubkeys/event ids — use `short()` for identifiers.
+// Structured JSON logging.
+//
+// Privacy rules:
+// * Never log device tokens, event content, raw network error messages, or
+//   full pubkeys/event ids.
+// * At `info` and above, never log anything that identifies a user or device
+//   (not even truncated): per-event and per-delivery activity is aggregated
+//   into a periodic `activity` line (see activity.ts). Per-user detail is
+//   `debug` only, and there identifiers go through `pseudonym()`, a keyed hash
+//   with a random per-process key, so lines can be correlated within one run
+//   but not linked to the database (or to another run's logs).
+
+import { createHmac, randomBytes } from 'node:crypto';
 
 type Level = 'debug' | 'info' | 'warn' | 'error';
 const ORDER: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
 let threshold: number = ORDER.info;
 let sink: (line: string) => void = (line) => process.stdout.write(line + '\n');
+const PSEUDONYM_KEY = randomBytes(32);
 
 export function setLogLevel(level: string): void {
   threshold = ORDER[(level as Level) in ORDER ? (level as Level) : 'info'];
@@ -16,10 +28,18 @@ export function setLogSink(fn: (line: string) => void): void {
   sink = fn;
 }
 
-/** First 8 chars of an identifier — enough to correlate, not to identify. */
-export function short(id: string | undefined | null): string {
+/** Is `level` currently emitted? (skip building expensive debug fields otherwise) */
+export function logs(level: Level): boolean {
+  return ORDER[level] >= threshold;
+}
+
+/**
+ * Opaque per-process pseudonym for an identifier (debug logs only): stable
+ * within this process, unlinkable to the stored pubkey/token or across restarts.
+ */
+export function pseudonym(id: string | undefined | null): string {
   if (!id) return '-';
-  return id.length <= 8 ? id : `${id.slice(0, 8)}…`;
+  return createHmac('sha256', PSEUDONYM_KEY).update(id).digest('hex').slice(0, 10);
 }
 
 function emit(level: Level, msg: string, fields?: Record<string, unknown>): void {

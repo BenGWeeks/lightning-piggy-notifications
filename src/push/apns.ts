@@ -6,7 +6,17 @@ import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
 import http2 from 'node:http2';
 import { errCode, log } from '../log.js';
 import type { Device } from '../store.js';
-import { ALERT_TITLE, alertBody, pushData, type PushNotification, type PushResult, type PushSender } from './types.js';
+import {
+  ALERT_TITLE,
+  alertBody,
+  pushData,
+  VALIDATION_DATA,
+  type PushNotification,
+  type PushResult,
+  type PushSender,
+  type TokenCheck,
+  type TokenTarget,
+} from './types.js';
 
 export const APNS_PRODUCTION = 'https://api.push.apple.com';
 export const APNS_SANDBOX = 'https://api.sandbox.push.apple.com';
@@ -50,7 +60,7 @@ export class ApnsSender implements PushSender {
     return this.jwt.token;
   }
 
-  buildRequest(device: Device, n: PushNotification): { origin: string; path: string; headers: Record<string, string>; body: string } {
+  buildRequest(device: TokenTarget, n: PushNotification): { origin: string; path: string; headers: Record<string, string>; body: string } {
     const origin = device.apnsEnv === 'sandbox' ? APNS_SANDBOX : APNS_PRODUCTION;
     const payload = {
       aps: {
@@ -87,15 +97,8 @@ export class ApnsSender implements PushSender {
       return { retry: true };
     }
     if (res.status === 200) return 'ok';
-    let reason = '';
-    try {
-      reason = String((JSON.parse(res.body) as { reason?: unknown }).reason ?? '');
-    } catch {
-      /* non-JSON body */
-    }
-    if (res.status === 410 || reason === 'BadDeviceToken' || reason === 'DeviceTokenNotForTopic' || reason === 'Unregistered') {
-      return 'invalid-token';
-    }
+    const reason = apnsReason(res.body);
+    if (isApnsInvalidToken(res.status, reason)) return 'invalid-token';
     if (res.status === 403 && reason === 'ExpiredProviderToken' && !retried) {
       this.providerToken(true);
       return this.send(device, n, stillValid, true);
@@ -105,6 +108,53 @@ export class ApnsSender implements PushSender {
     log.warn('apns rejected push', { status: res.status, reason: reason.slice(0, 40), app: device.app });
     return 'error';
   }
+
+  /**
+   * Admission check: a background (`content-available`) push, which shows
+   * nothing. APNs has no dry-run, so this is the closest to one; the app sees
+   * `{ source: 'lp-watcher', type: 'validate' }` at most and should ignore it.
+   * `apns-expiration: 0` means it is never stored for an offline device.
+   */
+  async validate(t: TokenTarget, retried = false): Promise<TokenCheck> {
+    const origin = t.apnsEnv === 'sandbox' ? APNS_SANDBOX : APNS_PRODUCTION;
+    const headers = {
+      authorization: `bearer ${this.providerToken()}`,
+      'apns-topic': t.app,
+      'apns-push-type': 'background',
+      'apns-priority': '5',
+      'apns-expiration': '0',
+      'content-type': 'application/json',
+    };
+    let res: ApnsResponse;
+    try {
+      res = await this.transport(origin, `/3/device/${t.token}`, headers, JSON.stringify({ aps: { 'content-available': 1 }, ...VALIDATION_DATA }));
+    } catch (e) {
+      log.warn('apns transport error', { err: errCode(e) });
+      return 'unavailable';
+    }
+    if (res.status === 200) return 'ok';
+    const reason = apnsReason(res.body);
+    if (isApnsInvalidToken(res.status, reason)) return 'invalid';
+    if (res.status === 403 && reason === 'ExpiredProviderToken' && !retried) {
+      this.providerToken(true);
+      return this.validate(t, true);
+    }
+    if (res.status !== 429 && res.status < 500) log.warn('apns rejected token check', { status: res.status, reason: reason.slice(0, 40), app: t.app });
+    return 'unavailable';
+  }
+}
+
+function apnsReason(body: string): string {
+  try {
+    return String((JSON.parse(body) as { reason?: unknown }).reason ?? '');
+  } catch {
+    return ''; // non-JSON body
+  }
+}
+
+/** The token is dead or not for this topic/environment. */
+function isApnsInvalidToken(status: number, reason: string): boolean {
+  return status === 410 || reason === 'BadDeviceToken' || reason === 'DeviceTokenNotForTopic' || reason === 'Unregistered';
 }
 
 /** Real transport: one cached HTTP/2 session per origin, recreated on close/error. */

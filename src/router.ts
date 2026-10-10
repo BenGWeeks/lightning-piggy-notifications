@@ -1,5 +1,7 @@
 // Event -> (user, category) routing. Uses only public event metadata (kind,
-// author, p-tags); content is never read or decrypted.
+// author, p-tags); content is never read or decrypted. Relay subscriptions
+// are uniform across users (plan.ts), so this is where each user's category
+// toggles are applied: an event only matches a category the user enabled.
 
 import type { NostrEvent } from 'nostr-tools/pure';
 import type { Category } from './registration.js';
