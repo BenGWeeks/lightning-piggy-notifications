@@ -1,0 +1,41 @@
+# Example: run the watcher with Transponder-style hardening.
+# Secrets are files (mode 600, owned by the container user) — never in git.
+services:
+  lightning-piggy-watcher:
+    image: lightning-piggy-notifications:0.1.0
+    build: .
+    container_name: lightning-piggy-watcher
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"            # owner of the secret files and ./data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ports:
+      - "127.0.0.1:18087:8080"   # /health + /ready on localhost only
+    environment:
+      WATCHER_PRIVATE_KEY_FILE: /run/secrets/watcher_private_key
+      WATCHER_TOKEN_KEY_FILE: /run/secrets/watcher_token_key
+      WATCHER_RELAYS: wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net
+      WATCHER_APPS: com.example.app
+      APNS_KEY_FILE: /credentials/apns-authkey.p8
+      APNS_KEY_ID: ABC123DEFG
+      APNS_TEAM_ID: TEAM123456
+      FCM_SERVICE_ACCOUNT_FILE: /credentials/fcm-service-account.json
+      LOG_LEVEL: info
+    volumes:
+      - ./data:/data
+      - ./credentials:/credentials:ro
+    secrets:
+      - watcher_private_key
+      - watcher_token_key
+
+secrets:
+  watcher_private_key:
+    file: ./secrets/watcher_private_key
+  watcher_token_key:
+    file: ./secrets/watcher_token_key

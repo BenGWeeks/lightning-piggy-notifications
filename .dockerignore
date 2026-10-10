@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+.git
+.github
+test
+*.db
+*.db-*
+.env*
+secrets
+*.key
+*.p8
+*service-account*.json

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.db
+*.db-*
+.env
+.env.*
+secrets/
+*.key
+*.p8
+*service-account*.json
