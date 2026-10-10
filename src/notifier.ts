@@ -70,6 +70,8 @@ export class Notifier {
   private readonly retryTimers = new Set<NodeJS.Timeout>();
   private idleWaiters: (() => void)[] = [];
   private stopped = false;
+  /** Set when drain() returns: the store may be closed, so late results never touch it. */
+  private detached = false;
 
   constructor(private readonly deps: NotifierDeps) {
     this.now = deps.now ?? Date.now;
@@ -132,7 +134,7 @@ export class Notifier {
 
   private pump(): void {
     const max = this.deps.concurrency ?? 32;
-    while (this.running < max && this.queue.length > 0) {
+    while (!this.stopped && this.running < max && this.queue.length > 0) {
       const job = this.queue.shift()!;
       this.running++;
       this.send(job)
@@ -206,6 +208,7 @@ export class Notifier {
         ? { category: n.category, platform: d.platform, app: d.app, attempt: job.attempt, count: n.count, user: pseudonym(d.user), device: pseudonym(d.tokenHash) }
         : {};
     const activity = this.deps.activity;
+    if (this.detached) return; // finished after shutdown: the store may be closed
     if (result === 'cancelled') {
       this.stats.dropped++;
       activity?.count('dropped', n.category);
@@ -266,18 +269,26 @@ export class Notifier {
     return Math.max(r.afterMs ?? 0, base + j * base);
   }
 
-  /** Stop accepting work, drop timers, and wait for in-flight sends (graceful shutdown). */
+  /**
+   * Graceful shutdown: stop accepting work, drop timers and queued jobs, and
+   * wait (bounded) for in-flight sends. After it returns, any send still
+   * finishing is ignored, so nothing touches the store once it is closed.
+   */
   async drain(timeoutMs = 10_000): Promise<void> {
     this.stopped = true;
     for (const w of this.windows.values()) clearTimeout(w.timer);
     this.windows.clear();
     for (const t of this.retryTimers) clearTimeout(t);
     this.retryTimers.clear();
-    if (this.running === 0 && this.queue.length === 0) return;
-    await Promise.race([
-      new Promise<void>((r) => this.idleWaiters.push(r)),
-      new Promise<void>((r) => setTimeout(r, timeoutMs).unref()),
-    ]);
+    this.stats.dropped += this.queue.length;
+    this.queue.length = 0;
+    if (this.running > 0) {
+      await Promise.race([
+        new Promise<void>((r) => this.idleWaiters.push(r)),
+        new Promise<void>((r) => setTimeout(r, timeoutMs).unref()),
+      ]);
+    }
+    this.detached = true;
   }
 
   /** Bound memory: forget buckets that have fully refilled. */

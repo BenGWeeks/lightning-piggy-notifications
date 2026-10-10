@@ -672,3 +672,46 @@ describe('routing applies the payment toggle (relay filters do not)', () => {
     expect(on.route(ev)).toEqual([{ user, category: 'payment' }]);
   });
 });
+
+describe('shutdown never touches a closed store', () => {
+  it('a send finishing after drain() returns is ignored, and queued jobs are dropped', async () => {
+    let release!: (r: PushResult) => void;
+    const writes: string[] = [];
+    const dev: Device = {
+      user: 'u'.repeat(64),
+      apnsEnv: 'production',
+      ts: 1,
+      tokenHash: 'h'.repeat(64),
+      app: 'com.lightningpiggy.app',
+      platform: 'fcm',
+      token: 't',
+      categories: { dm: true, zap: true, mention: true, payment: true },
+    };
+    const { Notifier } = await import('../src/notifier.js');
+    const n = new Notifier({
+      store: {
+        devicesFor: () => [dev, { ...dev, tokenHash: 'g'.repeat(64) }],
+        removeRegistration: () => {
+          writes.push('remove');
+          return true;
+        },
+        isCurrent: () => true,
+        markValidated: () => {
+          writes.push('validated');
+        },
+      },
+      senders: { fcm: { send: () => new Promise<PushResult>((r) => (release = r)) } },
+      coalesceWindowSec: 30,
+      devicePushesPerHour: 60,
+      concurrency: 1,
+      onRegistrationsChanged: () => {},
+    });
+    n.notify(dev.user, 'dm');
+    await waitFor(() => n.stats.attempted === 1);
+    await n.drain(50); // times out with the send still in flight
+    release('ok');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(writes).toEqual([]);
+    expect(n.stats.attempted).toBe(1); // the queued second job never started
+  });
+});

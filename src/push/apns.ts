@@ -4,7 +4,7 @@
 
 import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
 import http2 from 'node:http2';
-import { errCode, log, warnThrottled } from '../log.js';
+import { errCode, warnThrottled } from '../log.js';
 import type { Device } from '../store.js';
 import {
   ALERT_TITLE,
@@ -174,7 +174,7 @@ export function http2Transport(timeoutMs = REQUEST_TIMEOUT_MS): ApnsTransport {
     const s = sessions.get(origin);
     if (s && !s.closed && !s.destroyed) return s;
     const ns = http2.connect(origin);
-    ns.on('error', (e) => log.warn('apns session error', { err: errCode(e) }));
+    ns.on('error', (e) => warnThrottled(`apns session ${errCode(e)}`, 'apns session error', { err: errCode(e) }));
     // Only evict the cache entry if it is still this session (a replacement may exist).
     const evict = () => {
       if (sessions.get(origin) === ns) sessions.delete(origin);

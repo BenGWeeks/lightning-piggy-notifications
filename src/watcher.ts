@@ -159,7 +159,7 @@ export class Watcher {
     if (this.checksRunning > 0) {
       await Promise.race([
         new Promise<void>((r) => this.checkIdleWaiters.push(r)),
-        new Promise<void>((r) => setTimeout(r, 20_000).unref()),
+        new Promise<void>((r) => setTimeout(r, 5_000).unref()),
       ]);
     }
     if (this.rebuildTimer) clearTimeout(this.rebuildTimer);

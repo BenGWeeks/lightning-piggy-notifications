@@ -90,7 +90,9 @@ Known limits:
   Every watched user gets the same filters, chunked to at most 400 `#p` values:
   one for kinds 1, 4 and 9735 and one for gift wraps, whatever categories they
   turned on. The router then drops events for categories a user didn't enable,
-  so relays can't infer per-user category settings. NWC filters (kinds
+  so relays can't infer per-user category settings. (A registration with
+  every category off isn't watched at all, so relays can see a user stop being
+  watched, as with unregistering.) NWC filters (kinds
   23196/23197 by client key) are sent only to the relays that user listed
   (their wallet's relay), not to every default relay. They are sent whenever
   the registration lists NWC connections, whether or not payment pushes are on,
