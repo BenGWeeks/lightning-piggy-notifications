@@ -51,7 +51,7 @@ Known limits:
 
 - A NIP-17 self-copy of a DM you sent triggers "New message" on your other devices.
 - Marmot welcomes look like DMs.
-- DMs on auth-gated inbox relays can't be seen.
+- DMs on auth-gated inbox relays can't be seen. As of October 2026 that includes relay.damus.io, which requires NIP-42 AUTH to read kind 1059. The watcher authenticates as itself, which is enough for its own registration inbox but not for users' gift wraps there. Users' DMs are still seen on nos.lol, primal and any public inbox relays they list.
 - Anyone can publish a kind 9735, so a forged receipt can produce a "Zap
   received" push. Receipts are not checked against the LNURL server key.
 
